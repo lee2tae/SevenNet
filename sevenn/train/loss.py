@@ -201,6 +201,59 @@ class StressLoss(LossDefinition):
         return pred, ref, w_tensor
 
 
+class EWCLoss(LossDefinition):
+    """
+    Elastic Weight Consolidation Loss.
+    Penalizes changes to important weights based on Fisher information matrix.
+    """
+
+    def __init__(
+        self,
+        fisher_dict: Dict[str, torch.Tensor],
+        opt_params_dict: Dict[str, torch.Tensor],
+        name: str = 'EWC',
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            name=name,
+            criterion=None,
+            ref_key=None,
+            pred_key=None,
+            use_weight=False,
+            ignore_unlabeled=False,
+        )
+        self.fisher_dict = fisher_dict
+        self.opt_params_dict = opt_params_dict
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def to(self, device) -> None:
+        for k in self.fisher_dict:
+            self.fisher_dict[k] = self.fisher_dict[k].to(device)
+        for k in self.opt_params_dict:
+            self.opt_params_dict[k] = self.opt_params_dict[k].to(device)
+        self.device = device
+
+    def get_loss(
+        self,
+        batch_data: Dict[str, Any],
+        model: Optional[Callable] = None
+    ) -> torch.Tensor:
+        _ = batch_data
+        if model is None:
+            raise ValueError('EWC requires model to compute loss')
+        ewc_loss = torch.tensor([0.0], device=self.device)
+        for name, _param in model.named_parameters():
+            if name not in self.fisher_dict or name not in self.opt_params_dict:
+                continue
+            fisher = self.fisher_dict[name]
+            opt_param = self.opt_params_dict[name]
+            ewc_loss += torch.sum(fisher * (_param - opt_param) ** 2)
+        return ewc_loss
+
+
 def get_loss_functions_from_config(
     config: Dict[str, Any],
 ) -> List[Tuple[LossDefinition, float]]:
@@ -223,8 +276,23 @@ def get_loss_functions_from_config(
     if config[KEY.IS_TRAIN_STRESS]:
         loss_functions.append((StressLoss(**commons), config[KEY.STRESS_WEIGHT]))
 
-    for loss_function, _ in loss_functions:  # why do these?
+    for loss_function, _ in loss_functions:
         if loss_function.criterion is None:
             loss_function.assign_criteria(criterion)
 
+    # Add EWC loss if fisher information and optimal params are provided
+    fisher_information_path = config.get(KEY.CONTINUE, {}).get(KEY.FISHER, False)
+    optimal_params_path = config.get(KEY.CONTINUE, {}).get(KEY.OPT_PARAMS, False)
+    
+    if fisher_information_path and optimal_params_path:
+        fisher_dict = torch.load(fisher_information_path, weights_only=True)
+        opt_params_dict = torch.load(optimal_params_path, weights_only=True)
+        ewc_lambda = float(config.get(KEY.CONTINUE, {}).get(KEY.EWC_LAMBDA, 0))
+        device = config.get(KEY.DEVICE, 'cpu')
+        if ewc_lambda > 0:
+            loss_functions.append(
+                (EWCLoss(fisher_dict, opt_params_dict, device=device), ewc_lambda / 2.0)
+            )
+
     return loss_functions
+

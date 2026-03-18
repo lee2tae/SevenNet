@@ -64,6 +64,10 @@ _ERROR_TYPES = {
         'name': 'TotalLoss',
         'unit': None,
     },
+    'EWCLoss': {
+        'name': 'EWC',
+        'unit': None,
+    },
 }
 
 
@@ -307,6 +311,49 @@ class CombinedError(ErrorMetric):
         return val
 
 
+class EWCError(ErrorMetric):
+    """
+    Error metric for tracking EWC loss.
+    This metric requires model and loss_functions to compute.
+    """
+
+    def __init__(self, ewc_loss_name: str = 'EWC', **kwargs) -> None:
+        super().__init__(ref_key='', pred_key='', **kwargs)
+        self._update_not_only_weight_flag = True
+        self.ewc_loss_name = ewc_loss_name
+        self._value: Optional[torch.Tensor] = None
+
+    def update(self, output: 'AtomGraphData') -> None:
+        _ = output
+        # EWC loss is updated via update_not_only_data
+        pass
+
+    def update_not_only_data(
+        self,
+        model: torch.nn.Module,
+        loss_functions: List[Tuple[LossDefinition, float]],
+        output: 'AtomGraphData',
+    ) -> None:
+        if self._value is not None:
+            return  # EWC loss no need average over steps
+        for loss_def, w in loss_functions:
+            if loss_def.name != self.ewc_loss_name:
+                continue
+            self._value = loss_def.get_loss(output, model) * w
+
+    def get(self) -> float:
+        if self._value is None:
+            return float('nan')
+        return self._value.item()
+
+    def reset(self) -> None:
+        self._value = None
+
+    def ddp_reduce(self, device: torch.device) -> None:
+        # EWC loss is same across all processes
+        pass
+
+
 class ErrorRecorder:
     """
     record errors of a model
@@ -435,6 +482,11 @@ class ErrorRecorder:
                         config, criteria, loss_functions
                     )
                 )
+                continue
+            if err_type == 'EWCLoss':  # special case for EWC
+                ewc_lambda = config.get(KEY.CONTINUE, {}).get(KEY.EWC_LAMBDA, 0)
+                if float(ewc_lambda) > 0:
+                    err_metrics.append(EWCError(**metric_kwargs))
                 continue
             metric_cls = ErrorRecorder.METRIC_DICT[metric_name]
             assert isinstance(metric_kwargs['name'], str)

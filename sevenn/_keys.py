@@ -232,3 +232,20 @@ USE_MLIAP = 'use_mliap'
 MLIAP_NUM_LOCAL_GHOST = 'mliap_num_local_ghost'
 MLIAP_NODE_FEATURE_GHOST = 'mliap_node_feature_ghost'
 LAMMPS_DATA = 'lammps_data'
+
+# ==================================================#
+# ~~~~~~~~ KEY for EWC (Fisher) configuration ~~~~~ #
+# ==================================================#
+CALC_FISHER = 'calc_fisher'
+OPT_PARAMS = 'opt_params'
+FISHER = 'fisher_information'
+EWC_LAMBDA = 'ewc_lambda'
+LOSS_THR = 'loss_threshold'
+
+# ==================================================#
+# ~~~~~~~~ KEY for Rehearsal configuration ~~~~~~~~ #
+# ==================================================#
+REHEARSAL = 'rehearsal'
+LOAD_MEMORY_PATH = 'load_memory_path'
+MEM_BATCH_SIZE: Final[str] = 'mem_batch_size'
+MEM_RATIO = 'mem_ratio'

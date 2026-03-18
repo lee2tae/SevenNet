@@ -155,6 +155,7 @@ class Trainer:
         if wrap_tqdm:
             total_len = wrap_tqdm if isinstance(wrap_tqdm, int) else None
             loader = tqdm(loader, total=total_len)
+
         for _, batch in enumerate(loader):
             if is_train:
                 self.optimizer.zero_grad()
@@ -230,3 +231,149 @@ class Trainer:
             self.optimizer.load_state_dict(optimizer_state_dict)
         if scheduler_state_dict is not None and self.scheduler is not None:
             self.scheduler.load_state_dict(scheduler_state_dict)
+
+    def compute_fisher_matrix(
+        self, loader: Iterable, loss_thr: float = -1.0
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]:
+        """
+        Compute Fisher information matrix and optimal parameters for EWC.
+
+        Args:
+            loader: DataLoader with batch_size=1 (required for Fisher computation)
+            loss_thr: Loss threshold for filtering samples. Use -1 for no threshold.
+
+        Returns:
+            fisher_information: Dict of Fisher information for each parameter
+            optimal_params: Dict of optimal parameter values
+            cnt_updated: Number of samples used for computation
+        """
+        fisher_information: Dict[str, torch.Tensor] = {}
+        for name, _param in self.model.named_parameters():
+            fisher_information[name] = torch.zeros_like(_param)
+
+        self.model.train()
+        cnt_updated = 0
+        for _, batch in enumerate(loader):
+            self.optimizer.zero_grad()
+            batch = batch.to(self.device, non_blocking=True)
+            output = self.model(batch)
+            total_loss = torch.tensor([0.0], device=self.device)
+            for loss_def, w in self.loss_functions:
+                loss_val = loss_def.get_loss(output, self.model)
+                if loss_val is not None:
+                    total_loss += loss_val * w
+            if loss_thr < 0 or total_loss.item() < loss_thr:
+                total_loss.backward()
+                for name, _param in self.model.named_parameters():
+                    if _param.grad is not None:
+                        fisher_information[name] += _param.grad.detach().clone() ** 2
+                cnt_updated += 1
+
+        for name in fisher_information:
+            if cnt_updated > 0:
+                fisher_information[name] /= cnt_updated
+
+        optimal_params = {
+            k: v.data.detach().clone() for k, v in self.model.named_parameters()
+        }
+        return fisher_information, optimal_params, cnt_updated
+
+
+class RehearsalTrainer(Trainer):
+    """
+    Trainer with rehearsal (memory replay) support for continual learning.
+    Interleaves memory batches with new task batches during training.
+    """
+
+    @classmethod
+    def from_config(cls, model: torch.nn.Module, config: Dict[str, Any]) -> 'RehearsalTrainer':
+        trainer = cls(
+            model,
+            loss_functions=get_loss_functions_from_config(config),
+            optimizer_cls=optim_dict[config.get(KEY.OPTIMIZER, 'adam').lower()],
+            optimizer_args=config.get(KEY.OPTIM_PARAM, {}),
+            scheduler_cls=scheduler_dict[
+                config.get(KEY.SCHEDULER, 'exponentiallr').lower()
+            ],
+            scheduler_args=config.get(KEY.SCHEDULER_PARAM, {}),
+            device=config.get(KEY.DEVICE, 'auto'),
+            distributed=config.get(KEY.IS_DDP, False),
+            distributed_backend=config.get(KEY.DDP_BACKEND, 'nccl'),
+        )
+        return trainer
+
+    def run_one_epoch_rehearsal(
+        self,
+        loader: Iterable,
+        memloader: Iterable,
+        is_train: bool = False,
+        error_recorder: Optional[ErrorRecorder] = None,
+        mem_recorder: Optional[ErrorRecorder] = None,
+    ) -> None:
+        """
+        Run single epoch with memory interleaving.
+
+        Args:
+            loader: DataLoader for new task data
+            memloader: DataLoader for memory (old task) data
+            is_train: if True, do backward() and optimizer step
+            error_recorder: ErrorRecorder for new task errors
+            mem_recorder: ErrorRecorder for memory errors
+        """
+        if is_train:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        # Memory iterator for interleaving
+        mem_iter = iter(memloader)
+
+        for _, batch in enumerate(loader):
+            # Train on new task batch
+            if is_train:
+                self.optimizer.zero_grad()
+            batch = batch.to(self.device, non_blocking=True)
+            output = self.model(batch)
+
+            if is_train:
+                total_loss = torch.tensor([0.0], device=self.device)
+                for loss_def, w in self.loss_functions:
+                    loss_val = loss_def.get_loss(output, self.model)
+                    if loss_val is not None:
+                        total_loss += loss_val * w
+                total_loss.backward()
+                self.optimizer.step()
+
+            if error_recorder is not None:
+                error_recorder.update(output)
+
+            # Train on memory batch
+            try:
+                batch_mem = next(mem_iter)
+            except StopIteration:
+                mem_iter = iter(memloader)  # Recreate iterator if exhausted
+                batch_mem = next(mem_iter)
+
+            if is_train:
+                self.optimizer.zero_grad()
+            batch_mem = batch_mem.to(self.device, non_blocking=True)
+            memout = self.model(batch_mem)
+
+            if is_train:
+                mem_loss = torch.tensor([0.0], device=self.device)
+                for loss_def, w in self.loss_functions:
+                    loss_val = loss_def.get_loss(memout, self.model)
+                    if loss_val is not None:
+                        mem_loss += loss_val * w
+                mem_loss.backward()
+                self.optimizer.step()
+
+            if mem_recorder is not None:
+                mem_recorder.update(memout)
+
+        if self.distributed:
+            if error_recorder is not None:
+                self.recorder_all_reduce(error_recorder)
+            if mem_recorder is not None:
+                self.recorder_all_reduce(mem_recorder)
+

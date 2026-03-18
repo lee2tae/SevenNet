@@ -148,7 +148,7 @@ def processing_continue(config: Dict[str, Any]):
     )
     config_cp = checkpoint['config']
 
-    model_cp, config_cp = util.model_from_checkpoint(checkpoint)
+    model_cp, config_cp = util.model_from_checkpoint(continue_dct[KEY.CHECKPOINT])
     model_state_dict_cp = model_cp.state_dict()
 
     # it will raise error if not compatible

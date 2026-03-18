@@ -27,6 +27,9 @@ def add_args(parser):
             'base',
             'multi_modal',
             'mf_ompa_fine_tune',
+            'compute_fisher',
+            'fine_tune_ewc',
+            'rehearsal',
         ],
         help=preset_help
     )

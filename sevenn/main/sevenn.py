@@ -142,6 +142,27 @@ def run(args):
         seed = global_config[KEY.RANDOM_SEED]
         random.seed(seed)
         torch.manual_seed(seed)
+        
+        # Check for Fisher computation mode
+        fisher = getattr(args, 'fisher', False)
+        if fisher or global_config.get(KEY.CONTINUE, {}).get(KEY.CALC_FISHER, False):
+            logger.writeline(
+                'Compute Fisher information from model and training set.'
+                ' No actual training will be performed.'
+                ' Ignoring rehearsal if it was True'
+            )
+            global_config[KEY.CONTINUE][KEY.CALC_FISHER] = True
+            global_config[KEY.REHEARSAL] = False
+            # Fisher computation enabled
+            from sevenn.scripts.train import train_fisher
+            train_fisher(global_config, working_dir)
+            return
+
+        # Check for rehearsal mode
+        if global_config.get(KEY.REHEARSAL, False):
+            from sevenn.rehearsal.train_rehearsal import train_rehearsal
+            train_rehearsal(global_config, working_dir)
+            return
 
         # run train
         if mode == 'train_v1':
@@ -206,6 +227,11 @@ def cmd_parser_train(parser):
         type=str,
         default='nccl',
         choices=['nccl', 'mpi'],
+    )
+    ag.add_argument(
+        '-fs', '--fisher',
+        help='compute fisher information from train set and model',
+        action='store_true',
     )
 
 

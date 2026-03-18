@@ -26,6 +26,7 @@ SUPPORTING_ERROR_TYPES = [
     'Stress',
     'Stress_GPa',
     'TotalLoss',
+    'EWCLoss',
 ]
 
 IMPLEMENTED_MODEL = ['E3_equivariant_model']
@@ -85,7 +86,7 @@ def error_record_condition(x):
             return False
         if v[0] not in SUPPORTING_ERROR_TYPES:
             return False
-        if v[0] == 'TotalLoss':
+        if v[0] == 'TotalLoss' or v[0] == 'EWCLoss':
             continue
         if v[1] not in SUPPORTING_METRICS:
             return False
@@ -267,7 +268,18 @@ DEFAULT_TRAINING_CONFIG = {
         KEY.RESET_EPOCH: False,
         KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT: True,
         KEY.USE_STATISTIC_VALUES_FOR_CP_MODAL_ONLY: True,
+        # EWC (Fisher) related
+        KEY.CALC_FISHER: False,
+        KEY.OPT_PARAMS: False,
+        KEY.FISHER: False,
+        KEY.EWC_LAMBDA: 0,
+        KEY.LOSS_THR: -1,
     },
+    # Rehearsal related
+    KEY.REHEARSAL: False,
+    KEY.LOAD_MEMORY_PATH: False,
+    KEY.MEM_BATCH_SIZE: 0,
+    KEY.MEM_RATIO: 1,
     # KEY.DEFAULT_MODAL: 'common',
     KEY.CSV_LOG: 'log.csv',
     KEY.NUM_WORKERS: 0,
