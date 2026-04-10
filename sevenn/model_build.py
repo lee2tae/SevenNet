@@ -28,6 +28,12 @@ from .nn.self_connection import (
     SelfConnectionLinearIntro,
     SelfConnectionOutro,
 )
+from .nn.les import (
+    AddLREnergy,
+    LatentChargeReadout,
+    LatentEwaldSum,
+    LESForceStressOutput,
+)
 from .nn.sequential import AtomGraphSequential
 
 # warning from PyTorch, about e3nn type annotations
@@ -599,19 +605,60 @@ def build_E3_equivariant_model(
         layers.update(interaction_builder(**param_interaction_block))
         irreps_x = irreps_out
 
+    if config.get(KEY.USE_LES, False):
+        les_cfg = config.get(KEY.LES_CONFIG, {})
+        # Latent charge readout must sit BEFORE init_feature_reduce because
+        # reduce_input_to_hidden overwrites KEY.NODE_FEATURE in-place.
+        # Reading here guarantees we use the full (pre-projection) node features.
+        layers['les_charge_readout'] = LatentChargeReadout(
+            irreps_in=irreps_x,  # type: ignore
+            data_key_in=KEY.NODE_FEATURE,
+            data_key_out=KEY.LES_Q,
+        )
+
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
-    layers.update(
-        {
-            'rescale_atomic_energy': init_shift_scale(config),
-            'reduce_total_enegy': AtomReduce(
-                data_key_in=KEY.ATOMIC_ENERGY,
-                data_key_out=KEY.PRED_TOTAL_ENERGY,
-            ),
-        }
-    )
+    if config.get(KEY.USE_LES, False):
+        les_cfg = config.get(KEY.LES_CONFIG, {})
+        layers.update(
+            {
+                'rescale_atomic_energy': init_shift_scale(config),
+                # SR energy: sum of per-atom (local) energies
+                'reduce_sr_energy': AtomReduce(
+                    data_key_in=KEY.ATOMIC_ENERGY,
+                    data_key_out=KEY.SR_ENERGY,
+                ),
+                # LR energy: Ewald summation on latent charges
+                'les_lr_energy': LatentEwaldSum(
+                    les_args=les_cfg.get('les_args', {'use_atomwise': False}),
+                    data_key_in=KEY.LES_Q,
+                    data_key_out=KEY.LR_ENERGY,
+                    compute_bec=les_cfg.get('compute_bec', False),
+                    bec_output_index=les_cfg.get('bec_output_index', None),
+                ),
+                # Total = SR + LR
+                'add_lr_to_total': AddLREnergy(
+                    key_sr=KEY.SR_ENERGY,
+                    key_lr=KEY.LR_ENERGY,
+                    data_key_out=KEY.PRED_TOTAL_ENERGY,
+                ),
+            }
+        )
+    else:
+        layers.update(
+            {
+                'rescale_atomic_energy': init_shift_scale(config),
+                'reduce_total_enegy': AtomReduce(
+                    data_key_in=KEY.ATOMIC_ENERGY,
+                    data_key_out=KEY.PRED_TOTAL_ENERGY,
+                ),
+            }
+        )
 
-    gradient_module = ForceStressOutputFromEdge()
+    if config.get(KEY.USE_LES, False):
+        gradient_module = LESForceStressOutput()
+    else:
+        gradient_module = ForceStressOutputFromEdge()
     grad_key = gradient_module.get_grad_key()
     layers.update({'force_output': gradient_module})
 
