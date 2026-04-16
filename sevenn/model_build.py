@@ -614,12 +614,13 @@ def build_E3_equivariant_model(
             irreps_in=irreps_x,  # type: ignore
             data_key_in=KEY.NODE_FEATURE,
             data_key_out=KEY.LES_Q,
+            hidden_channels=les_cfg.get('hidden_channels', None),
+            zero_init=les_cfg.get('zero_init', False),
         )
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
     if config.get(KEY.USE_LES, False):
-        les_cfg = config.get(KEY.LES_CONFIG, {})
         layers.update(
             {
                 'rescale_atomic_energy': init_shift_scale(config),

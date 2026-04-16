@@ -59,10 +59,11 @@ ATOMIC_ENERGY: Final[str] = 'atomic_energy'
 PRED_TOTAL_ENERGY: Final[str] = 'inferred_total_energy'
 
 # LES (Latent Ewald Summation) outputs
-LES_Q: Final[str] = 'les_latent_charge'      # (N_atoms, 1) per-atom latent charge
-SR_ENERGY: Final[str] = 'les_sr_energy'      # (n_graphs,) short-range energy sum
-LR_ENERGY: Final[str] = 'les_lr_energy'      # (n_graphs,) long-range Ewald energy
-LES_BEC: Final[str] = 'les_born_eff_charge'  # (N_atoms, 3, 3) Born effective charges
+LES_Q: Final[str] = 'les_latent_charge'           # (N_atoms, 1) per-atom latent charge
+SR_ENERGY: Final[str] = 'les_sr_energy'            # (n_graphs,) short-range energy sum
+LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewald energy
+LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges
+LES_CELL: Final[str] = 'les_differentiable_cell'   # (n_graphs, 3, 3) leaf for Ewald stress grad
 
 PRED_PER_ATOM_ENERGY: Final[str] = 'inferred_per_atom_energy'
 PER_ATOM_ENERGY: Final[str] = 'per_atom_energy'
