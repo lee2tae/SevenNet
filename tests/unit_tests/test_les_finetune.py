@@ -362,3 +362,108 @@ class TestZeroInitEquivalence:
             f'Stress mismatch (max abs diff): '
             f'{(out_les[KEY.PRED_STRESS] - out_sr[KEY.PRED_STRESS]).abs().max().item():.2e}'
         )
+
+
+N_CHARGES = 4  # number of latent charge channels used in multi-q tests
+
+
+class TestMultiDimensionalQ:
+    """
+    Tests for multi-channel latent charges (n_charges > 1).
+
+    With n_charges=N_CHARGES the readout maps node features to
+    (N_atoms, N_CHARGES) and the Ewald energy is the sum of N_CHARGES
+    independent Coulomb interactions, one per channel.
+    """
+
+    @pytest.fixture(scope='class')
+    def les_model_mq(self, omni_checkpoint):
+        """LES model with n_charges=N_CHARGES, SR params frozen."""
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter('always')
+            model = omni_checkpoint.build_model_with_les(
+                les_config={
+                    'les_args': {'use_atomwise': False},
+                    'n_charges': N_CHARGES,
+                    # non-zero init so that charges and LR energy are nonzero
+                },
+                freeze_sr=True,
+            )
+        return model.to(DEVICE)
+
+    # ── shape ────────────────────────────────────────────────────────────────
+
+    def test_charge_shape(self, les_model_mq, nacl_graph):
+        """LES_Q must have shape (N_atoms, N_CHARGES)."""
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        q = out[KEY.LES_Q]
+        n_atoms = int(nacl_graph[KEY.NUM_ATOMS].item())
+        assert q.shape == (n_atoms, N_CHARGES), (
+            f'Expected LES_Q shape ({n_atoms}, {N_CHARGES}), got {tuple(q.shape)}'
+        )
+
+    def test_force_shape(self, les_model_mq, nacl_graph):
+        """Force shape must be (N_atoms, 3) regardless of n_charges."""
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        n_atoms = int(nacl_graph[KEY.NUM_ATOMS].item())
+        assert out[KEY.PRED_FORCE].shape == (n_atoms, 3)
+
+    # ── inference ────────────────────────────────────────────────────────────
+
+    def test_energy_finite(self, les_model_mq, nacl_graph):
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        assert torch.isfinite(out[KEY.PRED_TOTAL_ENERGY]).all()
+
+    def test_force_finite(self, les_model_mq, nacl_graph):
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        assert torch.isfinite(out[KEY.PRED_FORCE]).all()
+
+    def test_stress_finite(self, les_model_mq, nacl_graph):
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        if KEY.PRED_STRESS in out:
+            assert torch.isfinite(out[KEY.PRED_STRESS]).all()
+
+    def test_lr_energy_nonzero(self, les_model_mq, nacl_graph):
+        """With default (non-zero) init, LR energy should be nonzero."""
+        les_model_mq.eval()
+        les_model_mq.set_is_batch_data(False)
+        out = les_model_mq(nacl_graph)
+        e_lr = out.get(KEY.LR_ENERGY)
+        if e_lr is not None:
+            assert not torch.allclose(e_lr, torch.zeros_like(e_lr), atol=1e-6), \
+                'E_LR is unexpectedly zero with non-zero-init multi-channel readout'
+
+    # ── training ─────────────────────────────────────────────────────────────
+
+    def test_backward_no_crash(self, les_model_mq, nacl_batch):
+        les_model_mq.train()
+        les_model_mq.set_is_batch_data(True)
+        les_model_mq.zero_grad()
+        out = les_model_mq(nacl_batch)
+        out[KEY.PRED_TOTAL_ENERGY].sum().backward()
+
+    def test_only_les_params_get_grad(self, les_model_mq, nacl_batch):
+        les_model_mq.train()
+        les_model_mq.set_is_batch_data(True)
+        les_model_mq.zero_grad()
+        out = les_model_mq(nacl_batch)
+        out[KEY.PRED_TOTAL_ENERGY].sum().backward()
+
+        les_prefixes = ('les_charge_readout.', 'les_lr_energy.')
+        for name, param in les_model_mq.named_parameters():
+            if name.startswith(les_prefixes):
+                assert param.grad is not None, \
+                    f'LES param {name!r} has no grad after backward'
+            else:
+                assert param.grad is None, \
+                    f'SR param {name!r} has grad despite being frozen: {param.grad}'

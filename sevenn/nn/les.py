@@ -4,7 +4,7 @@ LES (Latent Ewald Summation) modules for SevenNet.
 Architecture:
   NODE_FEATURE (last conv. layer, all-scalar)
       │
-      ├─→ [LatentChargeReadout] → LES_Q (N_atoms, 1)
+      ├─→ [LatentChargeReadout] → LES_Q (N_atoms, n_charges)
       │
       └─→ [init_feature_reduce] → ATOMIC_ENERGY → [AtomReduce] → SR_ENERGY
                                                                        │
@@ -43,19 +43,23 @@ from .util import broadcast
 
 class LatentChargeReadout(nn.Module):
     """
-    Projects node features to one scalar latent charge per atom.
+    Projects node features to per-atom latent charges.
 
     Architecture (controlled by ``hidden_channels``):
         hidden_channels=[] (default):
-            irreps_in ──[e3nn Linear]──► (N, 1)
+            irreps_in ──[e3nn Linear]──► (N, n_charges)
         hidden_channels=[H, ...]:
-            irreps_in ──[e3nn Linear]──► (N, H) ──[SiLU + nn.Linear]──► (N, 1)
+            irreps_in ──[e3nn Linear]──► (N, H) ──[SiLU + nn.Linear]──► (N, n_charges)
 
     The first layer is always e3nn Linear to handle arbitrary input irreps.
     Subsequent layers are standard nn.Linear (no bias) with SiLU activations.
 
     Args:
         irreps_in:       e3nn irreps of the input node features.
+        n_charges:       number of latent charge channels per atom (default 1).
+                         With n_charges > 1 the Ewald energy is the sum of
+                         n_charges independent Coulomb interactions, one per
+                         channel: E_LR = Σ_α E_Coulomb(q^α).
         hidden_channels: hidden layer widths, e.g. [128] for one hidden layer.
         zero_init:       zero-initialise all weights so E_LR = 0 at init.
                          Useful for transparent-wrapper tests; not for training.
@@ -66,24 +70,26 @@ class LatentChargeReadout(nn.Module):
         irreps_in: Irreps,
         data_key_in: str = KEY.NODE_FEATURE,
         data_key_out: str = KEY.LES_Q,
+        n_charges: int = 1,
         hidden_channels: Optional[list] = None,
         zero_init: bool = False,
     ):
         super().__init__()
         self.key_input = data_key_in
         self.key_output = data_key_out
+        self.n_charges = n_charges
 
         if hidden_channels is None:
             hidden_channels = []
 
-        first_out = hidden_channels[0] if hidden_channels else 1
+        first_out = hidden_channels[0] if hidden_channels else n_charges
         self.first_linear = Linear(
             irreps_in, Irreps(f'{first_out}x0e'), biases=False
         )
 
         scalar_layers: list[nn.Module] = []
         if hidden_channels:
-            dims = hidden_channels + [1]
+            dims = hidden_channels + [n_charges]
             for i in range(len(dims) - 1):
                 scalar_layers.append(nn.SiLU())
                 scalar_layers.append(nn.Linear(dims[i], dims[i + 1], bias=False))
@@ -152,7 +158,7 @@ class LatentEwaldSum(nn.Module):
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
-        q = data[self.key_input]   # (N_atoms, 1)
+        q = data[self.key_input]   # (N_atoms, n_charges)
         pos = data[KEY.POS]        # (N_atoms, 3)
 
         # Enable pos gradients for direct Ewald force (Path 2).

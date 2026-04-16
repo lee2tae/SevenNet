@@ -614,6 +614,7 @@ def build_E3_equivariant_model(
             irreps_in=irreps_x,  # type: ignore
             data_key_in=KEY.NODE_FEATURE,
             data_key_out=KEY.LES_Q,
+            n_charges=les_cfg.get('n_charges', 1),
             hidden_channels=les_cfg.get('hidden_channels', None),
             zero_init=les_cfg.get('zero_init', False),
         )

@@ -398,6 +398,10 @@ class SevenNetCheckpoint:
                 ``LES_CONFIG``.  Supported keys:
                   les_args (dict)          — kwargs for ``Les()``,
                                              default ``{'use_atomwise': False}``
+                  n_charges (int)          — number of latent charge channels
+                                             per atom; the Ewald energy is the
+                                             sum of n_charges independent
+                                             Coulomb interactions, default 1
                   hidden_channels (list)   — hidden layer widths for the charge
                                              readout MLP, e.g. ``[128]`` for a
                                              two-layer 128→128→1 network,
