@@ -4,44 +4,31 @@ LES (Latent Ewald Summation) modules for SevenNet.
 Architecture:
   NODE_FEATURE (last conv. layer, all-scalar)
       │
-      ├─→ [LatentChargeReadout]  → LES_Q  (N_atoms, 1)
-      │        (e3nn Linear, zero-init)
+      ├─→ [LatentChargeReadout] → LES_Q (N_atoms, 1)
       │
-      └─→ [init_feature_reduce] → SCALED_ATOMIC_ENERGY → ATOMIC_ENERGY
-                                                               │
-                                                  [AtomReduce (sum)]
-                                                               │
-                                                          SR_ENERGY  (n_graphs,)
-                                                               │
-  LES_Q ──→ [LatentEwaldSum] ──→ LR_ENERGY (n_graphs,)        │
-                  (les lib)                                     │
-                                                  [AddLREnergy (+)]
-                                                               │
-                                                    PRED_TOTAL_ENERGY
-                                                               │
-                                              [LESForceStressOutput]
+      └─→ [init_feature_reduce] → ATOMIC_ENERGY → [AtomReduce] → SR_ENERGY
+                                                                       │
+  LES_Q ──→ [LatentEwaldSum] ──→ LR_ENERGY ──→ [AddLREnergy] ─────────┘
+                                                       │
+                                              PRED_TOTAL_ENERGY
+                                                       │
+                                           [LESForceStressOutput]
 
-Force computation decomposition:
-  F_total = F_edge  +  F_lr_pos
-  ├── F_edge   : d(E_total)/d(EDGE_VEC) via edge scatter
-  │              Captures SR forces + q-path LR forces
-  │              (q-path: LR_ENERGY → LES_Q → NODE_FEAT → EDGE_VEC)
-  └── F_lr_pos : -d(LR_ENERGY)/d(POS)
-                 Captures direct Ewald positional forces
-                 (reciprocal-space: LR_ENERGY → POS directly)
+Forces:
+  F_edge   = -d(E_total)/d(EDGE_VEC)  SR forces + q-path LR forces
+  F_lr_pos = -d(E_LR)/d(POS)          direct Ewald positional forces
 
-Stress computation:
-  Edge virial  : d(E_total)/d(EDGE_VEC) → virial formula (SR + q-path LR)
-  Ewald stress : -d(LR_ENERGY)/d(LES_CELL) → cell-gradient formula
-                 LES_CELL is a cloned differentiable copy of the cell stored
-                 by LatentEwaldSum so LESForceStressOutput can differentiate
-                 the direct reciprocal-space cell dependence.
-                 Formula: σ_lr = -(1/V) * cell^T @ (dE_lr/dcell)
-                 consistent with SevenNet's ForceStressOutput strain formula.
+Stress:
+  σ_edge = -(1/V) Σ_ij F_ij ⊗ r_ij   edge virial (SR + q-path LR)
+  σ_lr   = -(1/V) d(E_LR)/d(LES_STRAIN)  complete Ewald stress via
+             affine strain applied to pos and cell before les()
+
+EDGE_VEC and POS are independent precomputed leaves, so the three
+gradient paths are non-overlapping.
 
 References:
   - LES library: https://github.com/ChengUCB/les
-  - NequIP-LES: https://github.com/ChengUCB/nequip-les
+  - NequIP-LES:  https://github.com/ChengUCB/nequip-les
 """
 from typing import Optional
 
@@ -59,29 +46,19 @@ class LatentChargeReadout(nn.Module):
     Projects node features to one scalar latent charge per atom.
 
     Architecture (controlled by ``hidden_channels``):
+        hidden_channels=[] (default):
+            irreps_in ──[e3nn Linear]──► (N, 1)
+        hidden_channels=[H, ...]:
+            irreps_in ──[e3nn Linear]──► (N, H) ──[SiLU + nn.Linear]──► (N, 1)
 
-        Single layer (default, ``hidden_channels=[]``):
-            irreps_in  ──[e3nn Linear]──►  (N, 1)   charge
-
-        Multi-layer MLP (e.g. ``hidden_channels=[128]``):
-            irreps_in  ──[e3nn Linear]──►  (N, 128)
-                       ──[SiLU]──────────►  (N, 128)
-                       ──[nn.Linear]─────►  (N, 1)   charge
-
-    The first layer is always an e3nn ``Linear`` so that arbitrary input
-    irreps (mixed scalar/vector/tensor) are handled correctly.  Subsequent
-    layers operate on plain scalars and use standard ``nn.Linear`` (no bias)
-    with SiLU activations between them.
+    The first layer is always e3nn Linear to handle arbitrary input irreps.
+    Subsequent layers are standard nn.Linear (no bias) with SiLU activations.
 
     Args:
-        irreps_in:        e3nn irreps of the input node features.
-        hidden_channels:  list of hidden scalar widths, e.g. ``[128]`` for
-                          one hidden layer of width 128.  Empty list (default)
-                          gives a direct single-layer projection.
-        zero_init:        if ``True``, zero-initialise all weights so that
-                          E_LR = 0 at the start.  Useful for transparent-wrapper
-                          verification but NOT for real fine-tuning (zero charges
-                          → zero Ewald gradient → no learning).
+        irreps_in:       e3nn irreps of the input node features.
+        hidden_channels: hidden layer widths, e.g. [128] for one hidden layer.
+        zero_init:       zero-initialise all weights so E_LR = 0 at init.
+                         Useful for transparent-wrapper tests; not for training.
     """
 
     def __init__(
@@ -99,13 +76,11 @@ class LatentChargeReadout(nn.Module):
         if hidden_channels is None:
             hidden_channels = []
 
-        # First layer: irreps_in → first_dim x 0e  (e3nn, no bias)
         first_out = hidden_channels[0] if hidden_channels else 1
         self.first_linear = Linear(
             irreps_in, Irreps(f'{first_out}x0e'), biases=False
         )
 
-        # Subsequent scalar layers: SiLU → nn.Linear per transition
         scalar_layers: list[nn.Module] = []
         if hidden_channels:
             dims = hidden_channels + [1]
@@ -121,44 +96,33 @@ class LatentChargeReadout(nn.Module):
                     nn.init.zeros_(m.weight)
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
-        x = self.first_linear(data[self.key_input])  # (N_atoms, first_out)
-        x = self.scalar_mlp(x)                       # (N_atoms, 1) after MLP
+        x = self.first_linear(data[self.key_input])
+        x = self.scalar_mlp(x)
         data[self.key_output] = x
         return data
 
 
 class LatentEwaldSum(nn.Module):
     """
-    Computes long-range energy via Ewald summation on learned latent charges.
+    Computes long-range energy via Ewald summation on latent charges.
 
-    Wraps the ``les`` library (https://github.com/ChengUCB/les).  Latent
-    charges ``LES_Q`` (N_atoms, 1) are treated as point charges and fed into
-    the Ewald sum, which decomposes the interaction energy into a real-space
-    (short-range) and a reciprocal-space (long-range) part.
+    Sets up two differentiable leaves for LESForceStressOutput:
 
-    Two differentiable leaf tensors are created for force/stress computation:
+    POS (KEY.POS):
+        requires_grad is enabled so d(E_LR)/d(pos) gives direct Ewald forces.
 
-    POS leaf:
-        ``data[KEY.POS].requires_grad_(True)`` is set so that
-        ``LESForceStressOutput`` can differentiate the direct positional
-        dependence of the Ewald sum (reciprocal-space term) w.r.t. positions.
-
-    LES_CELL leaf (``KEY.LES_CELL``):
-        A cloned copy of the cell with ``requires_grad=True`` is stored in
-        data. ``LESForceStressOutput`` differentiates ``LR_ENERGY`` w.r.t.
-        this to compute the direct Ewald cell-vector stress contribution.
-        The formula ``σ_lr = -(1/V) * cell^T @ (dE_lr/dcell)`` is consistent
-        with SevenNet's ``ForceStressOutput`` strain approach.
-
-    The ``_is_batch_data`` flag is controlled by
-    ``AtomGraphSequential.set_is_batch_data()`` at inference time.
+    LES_STRAIN (KEY.LES_STRAIN):
+        Zero (n_graphs, 3, 3) leaf. Its symmetric part is applied to both pos
+        and cell before les(), so d(E_LR)/d(les_strain) captures the complete
+        Ewald stress (positional virial + cell contribution) in one autograd
+        call. Formula: σ_lr = -(1/V) * strain_grad.
 
     Args:
-        les_args: keyword dict forwarded to ``Les()``.
-        data_key_in: data key for per-atom latent charges (N_atoms, 1).
-        data_key_out: data key for per-graph LR energy written by this module.
-        compute_bec: if True, compute Born effective charges.
-        bec_output_index: 0/1/2 to return only the x/y/z component of BEC.
+        les_args:         kwargs forwarded to Les().
+        data_key_in:      per-atom latent charges (N_atoms, 1).
+        data_key_out:     per-graph LR energy output.
+        compute_bec:      if True, compute Born effective charges.
+        bec_output_index: 0/1/2 for x/y/z component of BEC.
     """
 
     def __init__(
@@ -185,53 +149,49 @@ class LatentEwaldSum(nn.Module):
         self.compute_bec = compute_bec
         self.bec_output_index = bec_output_index
         self.les = Les(les_args)
-        # Controlled by AtomGraphSequential.set_is_batch_data()
-        self._is_batch_data = True
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         q = data[self.key_input]   # (N_atoms, 1)
         pos = data[KEY.POS]        # (N_atoms, 3)
 
-        # Enable positional gradients so LESForceStressOutput can compute
-        # d(LR_ENERGY)/d(POS) — the direct Ewald positional force term.
-        # Only acts on leaf tensors (precomputed positions in training pipeline).
+        # Enable pos gradients for direct Ewald force (Path 2).
         if torch.is_grad_enabled() and pos.is_leaf and not pos.requires_grad:
             pos.requires_grad_(True)
 
         if self._is_batch_data:
-            batch = data[KEY.BATCH].long()           # (N_atoms,)
+            batch = data[KEY.BATCH].long()
             n_graphs = int(batch.max().item()) + 1
         else:
-            batch = torch.zeros(
-                pos.shape[0], dtype=torch.long, device=pos.device
-            )
+            batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
             n_graphs = 1
 
-        # SevenNet stores cell as (3, 3) per structure.  PyG's Collater
-        # concatenates along dim-0 when batching, so batched cell is
-        # (3*n_graphs, 3).  Reshaping to (-1, 3, 3) handles both cases.
+        # Batched cell: SevenNet stores (3,3) per graph; PyG stacks to (3*n,3).
         if KEY.CELL in data:
             cell = data[KEY.CELL].view(-1, 3, 3)  # (n_graphs, 3, 3)
         else:
-            cell = torch.zeros(
-                (n_graphs, 3, 3), device=pos.device, dtype=pos.dtype
-            )
+            cell = torch.zeros((n_graphs, 3, 3), device=pos.device, dtype=pos.dtype)
 
-        # Create a differentiable copy of the cell for Ewald stress computation.
-        # LESForceStressOutput differentiates LR_ENERGY w.r.t. les_cell to get
-        # the direct Ewald cell-vector stress: σ_lr = -(1/V) * cell^T @ (dE/dcell).
-        # Using detach().clone() ensures a fresh leaf regardless of whether cell
-        # is a view or has upstream operations (e.g. from EdgePreprocess strain).
-        les_cell = cell
         if torch.is_grad_enabled():
-            les_cell = cell.detach().clone().requires_grad_(True)
-            data[KEY.LES_CELL] = les_cell
+            # Strain leaf for LR stress (Path 3).
+            # Apply symmetric strain to pos and cell so that
+            # d(E_LR)/d(les_strain) gives the complete affine-deformation
+            # Ewald stress in one autograd call.
+            les_strain = torch.zeros(
+                (n_graphs, 3, 3), dtype=pos.dtype, device=pos.device,
+            )
+            les_strain.requires_grad_(True)
+            data[KEY.LES_STRAIN] = les_strain
+
+            sym_strain = 0.5 * (les_strain + les_strain.transpose(-1, -2))
+            pos = pos + torch.bmm(pos.unsqueeze(-2), sym_strain[batch]).squeeze(-2)
+            cell = cell + torch.bmm(cell, sym_strain)
 
         les_result = self.les(
             latent_charges=q,
             positions=pos,
             batch=batch,
-            cell=les_cell,
+            cell=cell,
             compute_energy=True,
             compute_bec=self.compute_bec,
             bec_output_index=self.bec_output_index,
@@ -240,7 +200,7 @@ class LatentEwaldSum(nn.Module):
         e_lr = les_result['E_lr']  # (n_graphs,)
         assert e_lr is not None
 
-        # Non-batch mode: return scalar to match AtomReduce's scalar SR_ENERGY
+        # Non-batch mode: squeeze to scalar to match SR_ENERGY from AtomReduce.
         data[self.key_output] = e_lr if self._is_batch_data else e_lr.squeeze()
 
         if self.compute_bec:
@@ -252,11 +212,7 @@ class LatentEwaldSum(nn.Module):
 
 
 class AddLREnergy(nn.Module):
-    """
-    Adds long-range energy to short-range energy to produce PRED_TOTAL_ENERGY.
-
-        PRED_TOTAL_ENERGY = SR_ENERGY + LR_ENERGY
-    """
+    """Adds LR energy to SR energy: PRED_TOTAL_ENERGY = SR_ENERGY + LR_ENERGY."""
 
     def __init__(
         self,
@@ -276,47 +232,19 @@ class AddLREnergy(nn.Module):
 
 class LESForceStressOutput(nn.Module):
     """
-    Force and stress computation for LES-equipped models.
+    Force and stress output for LES models. Replaces ForceStressOutputFromEdge.
 
-    Three-path force computation:
+    Three gradient paths in a single torch.autograd.grad call:
+      Path 1  d(E_total)/d(EDGE_VEC)  SR + q-path LR forces; edge virial stress
+      Path 2  d(E_LR)/d(POS)          direct Ewald positional forces
+      Path 3  d(E_LR)/d(LES_STRAIN)   complete Ewald stress (pos + cell)
 
-    Path 1 — edge gradient  (d(E_total)/d(EDGE_VEC)):
-        Captures SR forces and q-path LR forces (LR_ENERGY → LES_Q → node
-        features → EDGE_VEC).  Also provides the edge-virial for stress.
+    All three are computed in one call because separate calls would free the
+    graph after Path 1 (retain_graph=False when create_graph=False at inference),
+    causing Path 2/3 to fail.
 
-    Path 2 — position gradient  (d(E_total)/d(POS) = d(E_LR)/d(POS)):
-        Captures the direct Ewald positional force that is NOT expressible as
-        an edge contribution.  Specifically the reciprocal-space term
-        E_k ~ |Σ_i q_i exp(ik·r_i)|² depends on absolute positions r_i.
-        ``LatentEwaldSum`` enables this by calling ``pos.requires_grad_(True)``
-        before the les() call.  In the training graph d(E_SR)/d(POS) = 0
-        (EDGE_VEC is a precomputed leaf independent of POS), so
-        d(E_total)/d(POS) reduces to d(E_LR)/d(POS).
-
-    Total force: F = F_edge + F_lr_pos  (no double-counting: EDGE_VEC and POS
-    are independent precomputed leaf tensors, so the q-path LR forces are
-    captured exclusively by Path 1 and the direct Ewald forces exclusively by
-    Path 2).
-
-    Stress:
-
-    Edge virial (Path 1):
-        Same edge-based virial formula as ForceStressOutputFromEdge.
-        Captures SR stress + q-path LR stress contribution.
-
-    Ewald cell stress (Path 3 — d(LR_ENERGY)/d(LES_CELL)):
-        ``LatentEwaldSum`` stores a cloned differentiable copy of the cell as
-        ``KEY.LES_CELL``.  Differentiating ``LR_ENERGY`` w.r.t. that tensor
-        gives the direct Ewald cell-vector stress contribution:
-
-            σ_lr = -(1/V) * cell^T @ (dE_lr/dcell)
-
-        This is derived from the strain formula used in
-        ``ForceStressOutput``: under a strain ε applied as
-        ``cell' = cell + cell @ sym_ε``,
-        ``dE/dε = cell^T @ (dE/dcell')`` at ε = 0.
-        The combined (edge-virial + cell-gradient) stress is stored in
-        ``KEY.PRED_STRESS``.
+    Atomic virial is not supported: direct Ewald forces (Path 2) depend on
+    absolute positions and have no pairwise decomposition.
     """
 
     def __init__(
@@ -327,55 +255,40 @@ class LESForceStressOutput(nn.Module):
         data_key_pos: str = KEY.POS,
         data_key_force: str = KEY.PRED_FORCE,
         data_key_stress: str = KEY.PRED_STRESS,
-        data_key_atomic_virial: str = KEY.PRED_ATOMIC_VIRIAL,
         data_key_cell_volume: str = KEY.CELL_VOLUME,
         use_atomic_virial: bool = False,
     ):
         super().__init__()
+        if use_atomic_virial:
+            raise NotImplementedError(
+                'Atomic virial is not supported for LES models. '
+                'Direct Ewald forces (Path 2) have no pairwise decomposition. '
+                'Use total stress instead.'
+            )
         self.key_edge = data_key_edge
         self.key_edge_idx = data_key_edge_idx
         self.key_energy = data_key_energy
         self.key_pos = data_key_pos
         self.key_force = data_key_force
         self.key_stress = data_key_stress
-        self.key_atomic_virial = data_key_atomic_virial
         self.key_cell_volume = data_key_cell_volume
-        self.use_atomic_virial = use_atomic_virial
-        # Controlled by AtomGraphSequential.set_is_batch_data()
-        self._is_batch_data = True
+        self.use_atomic_virial = False
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def get_grad_key(self) -> str:
-        # Primary grad key: AtomGraphSequential sets EDGE_VEC.requires_grad=True
         return self.key_edge
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         tot_num = torch.sum(data[KEY.NUM_ATOMS])
-        rij = data[self.key_edge]        # requires_grad=True (from AtomGraphSequential)
+        rij = data[self.key_edge]
         energy = [(data[self.key_energy]).sum()]
         edge_idx = data[self.key_edge_idx]
         pos = data[self.key_pos]
 
-        # ── Single backward pass for all three gradient paths ──
-        #
-        # Three separate torch.autograd.grad calls would fail during inference:
-        # create_graph=False → retain_graph=False, so Path 1 frees les()'s
-        # saved tensors (via the charge path E_total→LR_ENERGY→les()→LES_Q→EDGE_VEC),
-        # and Path 2/3 raise RuntimeError when they try to reuse the freed graph.
-        # A single call computes all gradients in one backward traversal.
-        #
-        # In the training graph, EDGE_VEC and POS are independent precomputed
-        # leaves, so:
-        #   d(E_total)/d(EDGE_VEC) = d(E_SR)/d(EDGE_VEC) + d(E_LR)/d(EDGE_VEC)
-        #                            (SR forces + q-path LR forces)
-        #   d(E_total)/d(POS)      = d(E_LR)/d(POS)
-        #                            (direct Ewald positional forces only;
-        #                             d(E_SR)/d(POS)=0 as EDGE_VEC is a leaf)
-        #   d(E_total)/d(LES_CELL) = d(E_LR)/d(LES_CELL)
-        #                            (Ewald cell-vector stress contribution)
-        has_les_cell = KEY.LES_CELL in data
+        has_les_strain = KEY.LES_STRAIN in data
         grad_inputs = [rij, pos]
-        if has_les_cell:
-            grad_inputs.append(data[KEY.LES_CELL])
+        if has_les_strain:
+            grad_inputs.append(data[KEY.LES_STRAIN])
 
         grads = torch.autograd.grad(
             energy,
@@ -384,13 +297,13 @@ class LESForceStressOutput(nn.Module):
             allow_unused=True,
         )
 
-        fij = grads[0]       # d(E_total)/d(EDGE_VEC)
-        pos_grad = grads[1]  # d(E_total)/d(POS) = d(E_LR)/d(POS) in training
-        cell_grad = grads[2] if has_les_cell else None  # d(E_LR)/d(LES_CELL)
+        fij = grads[0]          # d(E_total)/d(EDGE_VEC): SR + q-path LR forces
+        pos_grad = grads[1]     # d(E_LR)/d(POS): direct Ewald forces
+        strain_grad = grads[2] if has_les_strain else None  # d(E_LR)/d(LES_STRAIN): Ewald stress
 
         force = torch.zeros(tot_num, 3, dtype=rij.dtype, device=rij.device)
 
-        # ── Path 1: edge gradient → SR forces + q-path LR forces + edge virial ──
+        # ── Path 1: edge gradient → forces + edge virial stress ──
         if fij is not None:
             pf = torch.zeros(tot_num, 3, dtype=fij.dtype, device=fij.device)
             nf = torch.zeros(tot_num, 3, dtype=fij.dtype, device=fij.device)
@@ -400,7 +313,6 @@ class LESForceStressOutput(nn.Module):
             nf.scatter_reduce_(0, _edge_dst, fij, reduce='sum')
             force = pf - nf
 
-            # Stress via virial formula from edge gradient
             diag = rij * fij
             s12 = rij[..., 0] * fij[..., 1]
             s23 = rij[..., 1] * fij[..., 2]
@@ -412,9 +324,6 @@ class LESForceStressOutput(nn.Module):
             _s = torch.zeros(tot_num, 6, dtype=fij.dtype, device=fij.device)
             _edge_dst6 = broadcast(edge_idx[1], _virial, 0)
             _s.scatter_reduce_(0, _edge_dst6, _virial, reduce='sum')
-
-            if self.use_atomic_virial:
-                data[self.key_atomic_virial] = torch.neg(_s)
 
             if self._is_batch_data:
                 batch = data[KEY.BATCH]
@@ -431,23 +340,19 @@ class LESForceStressOutput(nn.Module):
                 torch.neg(sout) / data[self.key_cell_volume].unsqueeze(-1)
             )
 
-        # ── Path 2: position gradient → direct Ewald LR positional forces ──
+        # ── Path 2: position gradient → direct Ewald forces ──
         if pos_grad is not None:
-            force = force - pos_grad  # F = -dE/dpos
+            force = force - pos_grad
 
         data[self.key_force] = force
 
-        # ── Path 3: cell gradient → direct Ewald LR cell stress ──
-        # σ_lr = -(1/V) * cell^T @ (dE_lr/dcell)
-        # Derived from the strain formula: dE/dε = cell^T @ (dE/dcell') at ε=0
-        # (consistent with SevenNet's ForceStressOutput).
-        if cell_grad is not None:
-            les_cell = data[KEY.LES_CELL]
+        # ── Path 3: strain gradient → complete LR stress ──
+        # σ_lr = -(1/V) * strain_grad  (affine deformation: pos + cell both strained)
+        if strain_grad is not None:
             volume = data[self.key_cell_volume]
             if self._is_batch_data:
                 lr_stress_3x3 = (
-                    torch.neg(les_cell.transpose(-2, -1) @ cell_grad)
-                    / volume.unsqueeze(-1).unsqueeze(-1)
+                    torch.neg(strain_grad) / volume.unsqueeze(-1).unsqueeze(-1)
                 )
                 lr_stress_voigt = torch.stack(
                     [
@@ -461,10 +366,7 @@ class LESForceStressOutput(nn.Module):
                     dim=-1,
                 )  # (n_graphs, 6)
             else:
-                lr_stress_3x3 = (
-                    torch.neg(les_cell.transpose(-2, -1) @ cell_grad).squeeze(0)
-                    / volume
-                )  # (3, 3)
+                lr_stress_3x3 = torch.neg(strain_grad.squeeze(0)) / volume  # (3, 3)
                 lr_stress_voigt = torch.stack(
                     [
                         lr_stress_3x3[0, 0],

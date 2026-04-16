@@ -143,6 +143,8 @@ class SevenNetCalculator(Calculator):
 
         self.model = model_loaded
         if self.compute_atomic_virial:
+            from sevenn.nn.les import LESForceStressOutput
+
             force_output = self.model._modules.get('force_output')
             if force_output is None or not hasattr(
                 force_output, 'use_atomic_virial'
@@ -150,6 +152,13 @@ class SevenNetCalculator(Calculator):
                 raise ValueError(
                     'compute_atomic_virial=True but model does not have '
                     'a force_output module with use_atomic_virial support.'
+                )
+            if isinstance(force_output, LESForceStressOutput):
+                raise NotImplementedError(
+                    'compute_atomic_virial=True is not supported for LES '
+                    'models. The edge-virial captures only SR and q-path LR '
+                    'contributions; the direct Ewald positional forces have '
+                    'no pairwise decomposition. Use total stress instead.'
                 )
             force_output.use_atomic_virial = True
 
