@@ -14,11 +14,12 @@ from .nn.convolution import IrrepsConvolution
 from .nn.edge_embedding import (
     BesselBasis,
     EdgeEmbedding,
+    EdgePreprocess,
     PolynomialCutoff,
     SphericalEncoding,
     XPLORCutoff,
 )
-from .nn.force_output import ForceStressOutputFromEdge
+from .nn.force_output import ForceStressOutput, ForceStressOutputFromEdge
 from .nn.interaction_blocks import NequIP_interaction_block
 from .nn.linear import AtomReduce, FCN_e3nn, IrrepsLinear
 from .nn.node_embedding import OnehotEmbedding
@@ -27,6 +28,11 @@ from .nn.self_connection import (
     SelfConnectionIntro,
     SelfConnectionLinearIntro,
     SelfConnectionOutro,
+)
+from .nn.les import (
+    AddLREnergy,
+    LatentChargeReadout,
+    LatentEwaldSum,
 )
 from .nn.sequential import AtomGraphSequential
 
@@ -458,7 +464,21 @@ def build_E3_equivariant_model(
 
     for data w/o cell volume, pred_stress has garbage values
     """
+    if parallel and config.get(KEY.USE_LES, False):
+        raise NotImplementedError(
+            'LES parallel mode is not supported on LES-legacy branch. '
+            'LES-legacy uses EdgePreprocess (serial) for unified pos/strain '
+            'gradients. Use the LES branch for training / parallel deployment.'
+        )
+
     layers = OrderedDict()
+
+    # Legacy serial LES: insert EdgePreprocess before edge_embedding so that
+    # pos → EDGE_VEC is live in the autograd graph.  The strain leaf created
+    # here is shared by LatentEwaldSum (cell) and ForceStressOutput (forces +
+    # complete stress), replacing the separate Path-2 / LES_STRAIN approach.
+    if config.get(KEY.USE_LES, False):
+        layers['edge_preprocess'] = EdgePreprocess(is_stress=True)
 
     cutoff = config[KEY.CUTOFF]
     num_species = config[KEY.NUM_SPECIES]
@@ -599,19 +619,65 @@ def build_E3_equivariant_model(
         layers.update(interaction_builder(**param_interaction_block))
         irreps_x = irreps_out
 
+    if config.get(KEY.USE_LES, False):
+        les_cfg = config.get(KEY.LES_CONFIG, {})
+        # Latent charge readout must sit BEFORE init_feature_reduce because
+        # reduce_input_to_hidden overwrites KEY.NODE_FEATURE in-place.
+        # Reading here guarantees we use the full (pre-projection) node features.
+        layers['les_charge_readout'] = LatentChargeReadout(
+            irreps_in=irreps_x,  # type: ignore
+            data_key_in=KEY.NODE_FEATURE,
+            data_key_out=KEY.LES_Q,
+            n_charges=les_cfg.get('n_charges', 1),
+            hidden_channels=les_cfg.get('hidden_channels', None),
+            zero_init=les_cfg.get('zero_init', False),
+        )
+
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
-    layers.update(
-        {
-            'rescale_atomic_energy': init_shift_scale(config),
-            'reduce_total_enegy': AtomReduce(
-                data_key_in=KEY.ATOMIC_ENERGY,
-                data_key_out=KEY.PRED_TOTAL_ENERGY,
-            ),
-        }
-    )
+    if config.get(KEY.USE_LES, False):
+        layers.update(
+            {
+                'rescale_atomic_energy': init_shift_scale(config),
+                # SR energy: sum of per-atom (local) energies
+                'reduce_sr_energy': AtomReduce(
+                    data_key_in=KEY.ATOMIC_ENERGY,
+                    data_key_out=KEY.SR_ENERGY,
+                ),
+                # LR energy: Ewald summation on latent charges
+                'les_lr_energy': LatentEwaldSum(
+                    les_args=les_cfg.get('les_args', {'use_atomwise': False}),
+                    data_key_in=KEY.LES_Q,
+                    data_key_out=KEY.LR_ENERGY,
+                    compute_bec=les_cfg.get('compute_bec', False),
+                    bec_output_index=les_cfg.get('bec_output_index', None),
+                ),
+                # Total = SR + LR
+                'add_lr_to_total': AddLREnergy(
+                    key_sr=KEY.SR_ENERGY,
+                    key_lr=KEY.LR_ENERGY,
+                    data_key_out=KEY.PRED_TOTAL_ENERGY,
+                ),
+            }
+        )
+    else:
+        layers.update(
+            {
+                'rescale_atomic_energy': init_shift_scale(config),
+                'reduce_total_enegy': AtomReduce(
+                    data_key_in=KEY.ATOMIC_ENERGY,
+                    data_key_out=KEY.PRED_TOTAL_ENERGY,
+                ),
+            }
+        )
 
-    gradient_module = ForceStressOutputFromEdge()
+    if config.get(KEY.USE_LES, False):
+        # Legacy serial mode: unified pos + _strain gradients via EdgePreprocess.
+        # ForceStressOutput differentiates w.r.t. strained pos (force) and
+        # _strain (complete stress — SR virial + LR positional + LR cell).
+        gradient_module = ForceStressOutput()
+    else:
+        gradient_module = ForceStressOutputFromEdge()
     grad_key = gradient_module.get_grad_key()
     layers.update({'force_output': gradient_module})
 

@@ -369,6 +369,140 @@ class SevenNetCheckpoint:
 
         return model
 
+    def build_model_with_les(
+        self,
+        les_config: Optional[Dict[str, Any]] = None,
+        freeze_sr: bool = True,
+        *,
+        enable_cueq: Optional[bool] = None,
+        enable_flash: Optional[bool] = None,
+        enable_oeq: Optional[bool] = None,
+    ) -> AtomGraphSequential:
+        """
+        Build a LES-equipped model initialised from this (non-LES) checkpoint.
+
+        New LES parameters not present in the pretrained state dict use their
+        default construction-time initialisation:
+          - ``les_charge_readout.linear.weight``: e3nn default (non-zero)
+            so that the Ewald gradient is non-zero and fine-tuning starts
+            immediately.  Pass ``les_config={'zero_init': True}`` to force
+            zero weights, which preserves the SR baseline exactly at epoch 0
+            but sets all charge gradients to zero — useful for verification
+            tests, not for real training.
+          - ``les_lr_energy.les.*``: Les() default init
+
+        All other parameters are loaded from the checkpoint unchanged.
+
+        Args:
+            les_config: LES configuration dict forwarded to the model builder as
+                ``LES_CONFIG``.  Supported keys:
+                  les_args (dict)          — kwargs for ``Les()``,
+                                             default ``{'use_atomwise': False}``
+                  n_charges (int)          — number of latent charge channels
+                                             per atom; the Ewald energy is the
+                                             sum of n_charges independent
+                                             Coulomb interactions, default 1
+                  hidden_channels (list)   — hidden layer widths for the charge
+                                             readout MLP, e.g. ``[128]`` for a
+                                             two-layer 128→128→1 network,
+                                             default ``[]`` (single layer)
+                  zero_init (bool)         — zero-initialise the charge readout
+                                             weights, default ``False``
+                  compute_bec (bool)       — compute Born effective charges,
+                                             default ``False``
+                  bec_output_index (int)   — 0/1/2 for BEC component,
+                                             default ``None``
+            freeze_sr: if ``True`` (default), set ``requires_grad=False`` on
+                all parameters whose top-level module is not
+                ``les_charge_readout`` or ``les_lr_energy``.  The Trainer
+                already filters parameters by ``requires_grad``, so no
+                Trainer changes are needed.
+            enable_cueq/enable_flash/enable_oeq: backend overrides (same
+                semantics as :meth:`build_model`).
+
+        Returns:
+            :class:`~sevenn.nn.sequential.AtomGraphSequential` with LES layers
+            added and SR weights loaded from the checkpoint.
+
+        Raises:
+            RuntimeError: if any *non*-LES keys are missing after loading,
+                indicating an unexpected model mismatch.
+        """
+        from .model_build import build_E3_equivariant_model
+
+        if les_config is None:
+            les_config = {}
+
+        # Resolve backend flags using the same logic as build_model()
+        try:
+            cp_using_cueq = self.config[KEY.CUEQUIVARIANCE_CONFIG]['use']
+        except KeyError:
+            cp_using_cueq = False
+        final_cueq = cp_using_cueq if enable_cueq is None else enable_cueq
+
+        cp_using_flash = self.config.get(KEY.USE_FLASH_TP, False)
+        final_flash = cp_using_flash if enable_flash is None else enable_flash
+
+        cp_using_oeq = self.config.get(KEY.USE_OEQ, False)
+        final_oeq = cp_using_oeq if enable_oeq is None else enable_oeq
+
+        if sum([final_cueq, final_flash, final_oeq]) > 1:
+            raise ValueError('Only one TP accelerator can be enabled.')
+
+        # Step 1: use build_model() to get a correctly backend-converted non-LES
+        # state dict.  This handles FlashTP↔e3nn and cueq↔e3nn in one place
+        # without duplicating the conversion logic here.
+        sr_state_dict = self.build_model(
+            enable_cueq=enable_cueq,
+            enable_flash=enable_flash,
+            enable_oeq=enable_oeq,
+        ).state_dict()
+
+        # Step 2: build the LES model with the identical resolved backend.
+        cfg_new = self.config
+        cfg_new[KEY.USE_LES] = True
+        cfg_new[KEY.LES_CONFIG] = les_config
+        cfg_new[KEY.USE_OEQ] = final_oeq
+        cfg_new[KEY.CUEQUIVARIANCE_CONFIG] = {'use': final_cueq}
+        cfg_new[KEY.USE_FLASH_TP] = final_flash
+
+        model = build_E3_equivariant_model(cfg_new)
+
+        # Step 3: load the already-converted SR state dict into the LES model.
+        # strict=False because LES-specific keys are absent from sr_state_dict.
+        missing, not_used = model.load_state_dict(sr_state_dict, strict=False)
+
+        # Only LES-specific keys should be absent from the pretrained checkpoint.
+        # Any other missing key means an unexpected model mismatch.
+        les_prefixes = ('les_charge_readout.', 'les_lr_energy.')
+        unexpected_missing = [
+            k for k in missing if not k.startswith(les_prefixes)
+        ]
+        if unexpected_missing:
+            raise RuntimeError(
+                'Unexpected missing keys when loading SR checkpoint into LES '
+                f'model: {unexpected_missing}'
+            )
+        if missing:
+            warnings.warn(
+                'LES parameters initialised from scratch (not in checkpoint): '
+                f'{missing}',
+                UserWarning,
+            )
+        if not_used:
+            warnings.warn(
+                f'Checkpoint keys not used in LES model: {not_used}',
+                UserWarning,
+            )
+
+        if freeze_sr:
+            les_module_names = {'les_charge_readout', 'les_lr_energy'}
+            for name, param in model.named_parameters():
+                if name.split('.')[0] not in les_module_names:
+                    param.requires_grad_(False)
+
+        return model
+
     def yaml_dict(self, mode: str) -> Dict[str, Any]:
         """
         Return dict for input.yaml from checkpoint config

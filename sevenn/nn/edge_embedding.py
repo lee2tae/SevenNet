@@ -12,8 +12,13 @@ from sevenn._const import AtomGraphDataType
 @compile_mode('script')
 class EdgePreprocess(nn.Module):
     """
-    preprocessing pos to edge vectors and edge lengths
-    currently used in sevenn/scripts/deploy for lammps serial model
+    Computes edge vectors and lengths from atomic positions, with optional
+    affine strain for stress computation.
+
+    Used exclusively by LES models (LES branch) as the first model
+    layer, restoring the pos → EDGE_VEC autograd connection so that
+    ForceStressOutput can recover forces and stress via positional and strain
+    gradients rather than edge-virial decomposition.
     """
 
     def __init__(self, is_stress: bool) -> None:
@@ -30,9 +35,9 @@ class EdgePreprocess(nn.Module):
         cell_shift = data[KEY.CELL_SHIFT]
         pos = data[KEY.POS]
 
-        batch = data[KEY.BATCH]  # for deploy, must be defined first
         if self.is_stress:
             if self._is_batch_data:
+                batch = data[KEY.BATCH]
                 num_batch = int(batch.max().cpu().item()) + 1
                 strain = torch.zeros(
                     (num_batch, 3, 3),
@@ -60,12 +65,25 @@ class EdgePreprocess(nn.Module):
                 pos = pos + torch.mm(pos, sym_strain)
                 cell = cell + torch.mm(cell, sym_strain)
 
+            # Write strained pos and cell back so that downstream modules
+            # (LatentEwaldSum, ForceStressOutput) receive tensors that are
+            # connected to _strain in the autograd graph.  This enables a
+            # single d(E)/d(_strain) call to capture the complete stress
+            # (SR virial + LR positional + LR cell/k-space) without a
+            # separate LES_STRAIN leaf inside LatentEwaldSum.
+            data[KEY.POS] = pos
+            if self._is_batch_data:
+                data[KEY.CELL] = cell.reshape(-1, 3)
+            else:
+                data[KEY.CELL] = cell
+
         idx_src = data[KEY.EDGE_IDX][0]
         idx_dst = data[KEY.EDGE_IDX][1]
 
         edge_vec = pos[idx_dst] - pos[idx_src]
 
         if self._is_batch_data:
+            batch = data[KEY.BATCH]
             edge_vec = edge_vec + torch.einsum(
                 'ni,nij->nj', cell_shift, cell[batch[idx_src]]
             )

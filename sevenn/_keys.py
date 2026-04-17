@@ -58,6 +58,12 @@ SCALED_ATOMIC_ENERGY: Final[str] = 'scaled_atomic_energy'
 ATOMIC_ENERGY: Final[str] = 'atomic_energy'
 PRED_TOTAL_ENERGY: Final[str] = 'inferred_total_energy'
 
+# LES (Latent Ewald Summation) outputs
+LES_Q: Final[str] = 'les_latent_charge'           # (N_atoms, n_charges) per-atom latent charges
+SR_ENERGY: Final[str] = 'les_sr_energy'            # (n_graphs,) short-range energy sum
+LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewald energy
+LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges
+
 PRED_PER_ATOM_ENERGY: Final[str] = 'inferred_per_atom_energy'
 PER_ATOM_ENERGY: Final[str] = 'per_atom_energy'
 
@@ -224,6 +230,10 @@ TRAIN_AVG_NUM_NEIGH = 'train_avg_num_neigh'  # deprecated
 USE_FLASH_TP = 'use_flash_tp'
 CUEQUIVARIANCE_CONFIG = 'cuequivariance_config'
 USE_OEQ = 'use_oeq'
+
+# LES model configuration keys
+USE_LES = 'use_les'
+LES_CONFIG = 'les_config'
 
 _NORMALIZE_SPH = '_normalize_sph'
 OPTIMIZE_BY_REDUCE = 'optimize_by_reduce'

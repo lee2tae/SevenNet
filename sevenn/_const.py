@@ -132,6 +132,9 @@ DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG = {
     KEY.USE_FLASH_TP: False,
     KEY.CUEQUIVARIANCE_CONFIG: {},
     KEY.USE_OEQ: False,
+    KEY.USE_LES: False,
+    # les_config keys: les_args (dict), compute_bec (bool), bec_output_index (int|None)
+    KEY.LES_CONFIG: {},
 }
 
 
@@ -180,6 +183,8 @@ MODEL_CONFIG_CONDITION = {
     KEY.USE_FLASH_TP: bool,
     KEY.CUEQUIVARIANCE_CONFIG: dict,
     KEY.USE_OEQ: bool,
+    KEY.USE_LES: bool,
+    KEY.LES_CONFIG: dict,
 }
 
 
