@@ -21,7 +21,6 @@ from sevenn.checkpoint import SevenNetCheckpoint
 from sevenn.train.dataload import unlabeled_atoms_to_graph
 from sevenn.util import pretrained_name_to_path
 
-
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope='module')
@@ -80,6 +79,7 @@ def nacl_graph(omni_checkpoint):
 def nacl_batch(nacl_graph):
     """Single NaCl graph wrapped as a PyG Batch (is_batch_data=True)."""
     from torch_geometric.data import Batch
+
     # Batch.from_data_list adds KEY.BATCH and turns DATA_MODALITY into a list
     return Batch.from_data_list([nacl_graph])
 
@@ -99,9 +99,9 @@ class TestBuildModelWithLES:
 
     def test_les_charge_readout_zero_init(self, les_model):
         """les_charge_readout should start at zero — E_LR = 0 initially."""
-        w = les_model._modules['les_charge_readout'].first_linear.weight
+        w = les_model._modules['les_charge_readout'].first_linear.linear.weight
         assert torch.allclose(w, torch.zeros_like(w)), \
-            'les_charge_readout.first_linear.weight should be zero-initialised'
+            'les_charge_readout.first_linear.linear.weight should be zero-initialised'
 
     def test_sr_structure_preserved(self, les_model, omni_checkpoint):
         """All SR param values must match the original checkpoint exactly."""
@@ -270,7 +270,7 @@ class TestTraining:
         # (They start at zero, so the *gradient* of loss w.r.t. them may be zero
         #  at q=0, but the Les() params should receive non-zero grads.)
         with torch.no_grad():
-            les_model._modules['les_charge_readout'].first_linear.weight.fill_(0.01)
+            les_model._modules['les_charge_readout'].first_linear.linear.weight.fill_(0.01)
 
         out = les_model(nacl_batch)
         loss = out[KEY.PRED_TOTAL_ENERGY].sum()
@@ -288,7 +288,7 @@ class TestTraining:
 
         # Restore les_charge_readout weights to zero for subsequent tests
         with torch.no_grad():
-            les_model._modules['les_charge_readout'].first_linear.weight.zero_()
+            les_model._modules['les_charge_readout'].first_linear.linear.weight.zero_()
 
     def test_force_computed_in_train_mode(self, les_model, nacl_batch):
         les_model.train()

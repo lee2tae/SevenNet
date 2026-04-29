@@ -209,6 +209,7 @@ USE_MODAL_NODE_EMBEDDING = 'use_modal_node_embedding'
 USE_MODAL_SELF_INTER_INTRO = 'use_modal_self_inter_intro'
 USE_MODAL_SELF_INTER_OUTRO = 'use_modal_self_inter_outro'
 USE_MODAL_OUTPUT_BLOCK = 'use_modal_output_block'
+USE_MODAL_LES_READOUT = 'use_modal_les_readout'
 
 READOUT_AS_FCN = 'readout_as_fcn'
 READOUT_FCN_HIDDEN_NEURONS = 'readout_fcn_hidden_neurons'
