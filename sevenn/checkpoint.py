@@ -374,7 +374,6 @@ class SevenNetCheckpoint:
         les_config: Optional[Dict[str, Any]] = None,
         freeze_sr: bool = True,
         *,
-        use_modal_les_readout: Optional[bool] = None,
         enable_cueq: Optional[bool] = None,
         enable_flash: Optional[bool] = None,
         enable_oeq: Optional[bool] = None,
@@ -466,12 +465,6 @@ class SevenNetCheckpoint:
         cfg_new[KEY.USE_OEQ] = final_oeq
         cfg_new[KEY.CUEQUIVARIANCE_CONFIG] = {'use': final_cueq}
         cfg_new[KEY.USE_FLASH_TP] = final_flash
-
-        # Per-modality independent q-readout. Default: enable when the
-        # checkpoint is multimodal so each channel gets its own MLP.
-        if use_modal_les_readout is None:
-            use_modal_les_readout = bool(cfg_new.get(KEY.USE_MODALITY, False))
-        cfg_new[KEY.USE_MODAL_LES_READOUT] = use_modal_les_readout
 
         model = build_E3_equivariant_model(cfg_new)
 

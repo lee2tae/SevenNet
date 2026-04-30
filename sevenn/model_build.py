@@ -218,10 +218,6 @@ def patch_modality(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
 
     num_modal = config[KEY.NUM_MODALITIES]
     for k, module in layers.items():
-        if isinstance(module, LatentChargeReadout):
-            if cfg.get(KEY.USE_MODAL_LES_READOUT, False) and k == 'les_charge_readout':
-                module.set_num_modalities(num_modal)
-            continue
         if not isinstance(module, IrrepsLinear):
             continue
         if (
