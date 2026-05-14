@@ -47,10 +47,9 @@ class LatentChargeReadout(nn.Module):
             irreps_in ──[IrrepsLinear]──► (N, H) ──[SiLU + nn.Linear]──► (N, n_charges)
 
     The first layer is SevenNet's IrrepsLinear (a thin wrapper around
-    e3nn.o3.Linear that operates on AtomGraphData dicts). It supports lazy
-    instantiation and the standard modality-aware one-hot concatenation, so
-    the readout integrates with FlashTP/cueq backend conversion and modality
-    handling without special-casing in the model builder.
+    e3nn.o3.Linear that operates on AtomGraphData dicts). Modality dependence
+    flows in through the upstream conv stack's modality-aware features; this
+    layer does not concatenate the modality one-hot itself.
 
     Args:
         irreps_in:       e3nn irreps of the input node features.
@@ -119,30 +118,8 @@ class LatentChargeReadout(nn.Module):
         if self._zero_init:
             nn.init.zeros_(self.first_linear.linear.weight)
 
-    def set_num_modalities(self, num_modalities: int) -> None:
-        """Make the q-readout modality-aware: input gets the one-hot concat."""
-        self.first_linear.set_num_modalities(num_modalities)
-
-    @property
-    def _is_batch_data(self) -> bool:
-        return self.first_linear._is_batch_data
-
-    @_is_batch_data.setter
-    def _is_batch_data(self, value: bool) -> None:
-        # AtomGraphSequential.set_is_batch_data only walks top-level modules;
-        # propagate the flag to the inner IrrepsLinear so its
-        # _patch_modal_to_data picks the correct batched/non-batched branch.
-        self.first_linear._is_batch_data = value
-
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
-        # IrrepsLinear._patch_modal_to_data concats the modality one-hot into
-        # data[key_input] in place. With key_in != key_out, we restore the
-        # original NODE_FEATURE so downstream modality-aware layers
-        # (e.g. reduce_input_to_hidden) don't re-concat the one-hot onto an
-        # already-augmented tensor.
-        saved_input = data[self.key_input]
         data = self.first_linear(data)
-        data[self.key_input] = saved_input
         if self._hidden_channels:
             data[self.key_output] = self.scalar_mlp(data[self._intermediate_key])
         return data
