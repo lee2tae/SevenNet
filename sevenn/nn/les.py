@@ -28,10 +28,12 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from e3nn.o3 import Irreps, Linear
+from e3nn.o3 import Irreps
 
 import sevenn._keys as KEY
 from sevenn._const import AtomGraphDataType
+
+from .linear import IrrepsLinear
 
 
 class LatentChargeReadout(nn.Module):
@@ -40,12 +42,15 @@ class LatentChargeReadout(nn.Module):
 
     Architecture (controlled by ``hidden_channels``):
         hidden_channels=[] (default):
-            irreps_in ──[e3nn Linear]──► (N, n_charges)
+            irreps_in ──[IrrepsLinear]──► (N, n_charges)
         hidden_channels=[H, ...]:
-            irreps_in ──[e3nn Linear]──► (N, H) ──[SiLU + nn.Linear]──► (N, n_charges)
+            irreps_in ──[IrrepsLinear]──► (N, H) ──[SiLU + nn.Linear]──► (N, n_charges)
 
-    The first layer is always e3nn Linear to handle arbitrary input irreps.
-    Subsequent layers are standard nn.Linear (no bias) with SiLU activations.
+    The first layer is SevenNet's IrrepsLinear (a thin wrapper around
+    e3nn.o3.Linear that operates on AtomGraphData dicts). It supports lazy
+    instantiation and the standard modality-aware one-hot concatenation, so
+    the readout integrates with FlashTP/cueq backend conversion and modality
+    handling without special-casing in the model builder.
 
     Args:
         irreps_in:       e3nn irreps of the input node features.
@@ -74,10 +79,19 @@ class LatentChargeReadout(nn.Module):
 
         if hidden_channels is None:
             hidden_channels = []
+        self._hidden_channels = list(hidden_channels)
 
         first_out = hidden_channels[0] if hidden_channels else n_charges
-        self.first_linear = Linear(
-            irreps_in, Irreps(f'{first_out}x0e'), biases=False
+        # Intermediate key only needed when a scalar MLP follows.
+        self._intermediate_key = (
+            f'{data_key_out}_intermediate' if hidden_channels else data_key_out
+        )
+        self.first_linear = IrrepsLinear(
+            irreps_in=irreps_in,
+            irreps_out=Irreps(f'{first_out}x0e'),
+            data_key_in=data_key_in,
+            data_key_out=self._intermediate_key,
+            biases=False,
         )
 
         scalar_layers: list[nn.Module] = []
@@ -88,16 +102,49 @@ class LatentChargeReadout(nn.Module):
                 scalar_layers.append(nn.Linear(dims[i], dims[i + 1], bias=False))
         self.scalar_mlp = nn.Sequential(*scalar_layers)
 
+        self._zero_init = zero_init
         if zero_init:
-            nn.init.zeros_(self.first_linear.weight)
             for m in self.scalar_mlp.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.zeros_(m.weight)
 
+    @property
+    def layer_instantiated(self) -> bool:
+        # AtomGraphSequential._instantiate_modules only walks top-level modules,
+        # so we expose the inner IrrepsLinear's lazy-instantiation status here.
+        return self.first_linear.layer_instantiated
+
+    def instantiate(self) -> None:
+        self.first_linear.instantiate()
+        if self._zero_init:
+            nn.init.zeros_(self.first_linear.linear.weight)
+
+    def set_num_modalities(self, num_modalities: int) -> None:
+        """Make the q-readout modality-aware: input gets the one-hot concat."""
+        self.first_linear.set_num_modalities(num_modalities)
+
+    @property
+    def _is_batch_data(self) -> bool:
+        return self.first_linear._is_batch_data
+
+    @_is_batch_data.setter
+    def _is_batch_data(self, value: bool) -> None:
+        # AtomGraphSequential.set_is_batch_data only walks top-level modules;
+        # propagate the flag to the inner IrrepsLinear so its
+        # _patch_modal_to_data picks the correct batched/non-batched branch.
+        self.first_linear._is_batch_data = value
+
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
-        x = self.first_linear(data[self.key_input])
-        x = self.scalar_mlp(x)
-        data[self.key_output] = x
+        # IrrepsLinear._patch_modal_to_data concats the modality one-hot into
+        # data[key_input] in place. With key_in != key_out, we restore the
+        # original NODE_FEATURE so downstream modality-aware layers
+        # (e.g. reduce_input_to_hidden) don't re-concat the one-hot onto an
+        # already-augmented tensor.
+        saved_input = data[self.key_input]
+        data = self.first_linear(data)
+        data[self.key_input] = saved_input
+        if self._hidden_channels:
+            data[self.key_output] = self.scalar_mlp(data[self._intermediate_key])
         return data
 
 
