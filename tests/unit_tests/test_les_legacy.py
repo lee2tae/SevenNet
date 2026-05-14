@@ -203,7 +203,54 @@ class TestLESLegacyArchitecture:
         g = _fresh(nacl_graph)
         les_model(g)
         assert '_strain' in g, '_strain leaf not found in data after forward'
+        # Must be a true autograd leaf so that d(E)/d(_strain) is well-defined.
         assert g['_strain'].requires_grad
+        assert g['_strain'].is_leaf
+
+    def test_is_batch_data_propagates(self, les_model):
+        """set_is_batch_data must reach top-level LES modules and EdgePreprocess."""
+        les_model.set_is_batch_data(False)
+        for name in ('edge_preprocess', 'les_lr_energy', 'force_output'):
+            assert les_model._modules[name]._is_batch_data is False, (
+                f'{name}._is_batch_data not set to False'
+            )
+
+        les_model.set_is_batch_data(True)
+        for name in ('edge_preprocess', 'les_lr_energy', 'force_output'):
+            assert les_model._modules[name]._is_batch_data is True, (
+                f'{name}._is_batch_data not restored to True'
+            )
+
+    def test_state_dict_round_trip(self):
+        """save → load → forward must reproduce original output bit-for-bit."""
+        model1 = build_E3_equivariant_model(
+            _les_config(zero_init=False), parallel=False
+        )
+        model2 = build_E3_equivariant_model(
+            _les_config(zero_init=False), parallel=False
+        )
+        # Different random init → outputs would normally differ.
+        sd = model1.state_dict()
+        missing, unexpected = model2.load_state_dict(sd, strict=True)
+        assert not missing, f'Unexpected missing keys: {missing}'
+        assert not unexpected, f'Unexpected extra keys: {unexpected}'
+
+        atoms = bulk('NaCl', 'rocksalt', a=5.63)
+        graph = AtomGraphData.from_numpy_dict(
+            dl.unlabeled_atoms_to_graph(atoms, CUTOFF, with_shift=True)
+        )
+        for m in (model1, model2):
+            m.eval()
+            m.set_is_batch_data(False)
+        out1 = model1(_fresh(graph))
+        out2 = model2(_fresh(graph))
+        assert torch.allclose(
+            out1[KEY.PRED_TOTAL_ENERGY], out2[KEY.PRED_TOTAL_ENERGY], atol=1e-6
+        )
+        assert torch.allclose(out1[KEY.PRED_FORCE], out2[KEY.PRED_FORCE], atol=1e-6)
+        assert torch.allclose(
+            out1[KEY.PRED_STRESS], out2[KEY.PRED_STRESS], atol=1e-6
+        )
 
 
 # ── non-batch inference ────────────────────────────────────────────────────────
@@ -247,6 +294,15 @@ class TestNonBatchInference:
             out[KEY.SR_ENERGY] + out[KEY.LR_ENERGY],
             atol=1e-6,
         )
+
+    def test_lr_energy_is_scalar(self, les_model, nacl_graph):
+        """Non-batch LR_ENERGY must be a scalar tensor so AddLREnergy doesn't
+        accidentally broadcast a (1,) tensor onto the scalar SR_ENERGY."""
+        out = _run(les_model, nacl_graph)
+        assert out[KEY.LR_ENERGY].shape == (), (
+            f'LR_ENERGY should be a scalar, got shape {tuple(out[KEY.LR_ENERGY].shape)}'
+        )
+        assert out[KEY.SR_ENERGY].shape == ()
 
 
 # ── batch inference ────────────────────────────────────────────────────────────
@@ -444,6 +500,65 @@ class TestSRIsolation:
     def test_total_equals_sr(self, les_model_zero, nacl_graph):
         out = _run(les_model_zero, nacl_graph)
         assert torch.allclose(out[KEY.PRED_TOTAL_ENERGY], out[KEY.SR_ENERGY], atol=1e-6)
+
+
+# ── LR contribution to force/stress ────────────────────────────────────────────
+
+class TestLRContribution:
+    """
+    With non-zero charges, the LR Ewald term must produce non-trivial
+    contributions to forces and stress. Compares against a zero-init
+    (SR-only) model that uses the same SR weights.
+
+    Catches bugs where the LR gradient path is silently broken (e.g.
+    LatentEwaldSum not connected to the autograd graph, or pos write-back
+    from EdgePreprocess missing).
+    """
+
+    @pytest.fixture(scope='class')
+    def shared_config(self):
+        return _les_config(zero_init=False, n_charges=1)
+
+    @pytest.fixture(scope='class')
+    def les_model_lr(self, shared_config):
+        return build_E3_equivariant_model(shared_config, parallel=False)
+
+    @pytest.fixture(scope='class')
+    def les_model_sr_only(self, shared_config, les_model_lr):
+        """Same SR weights as les_model_lr, but charges forced to zero."""
+        cfg = dict(shared_config)
+        cfg['les_config'] = {**cfg['les_config'], 'zero_init': True}
+        m = build_E3_equivariant_model(cfg, parallel=False)
+        # Copy SR weights so only the LR term differs.
+        src_sd = les_model_lr.state_dict()
+        dst_sd = m.state_dict()
+        for k in dst_sd:
+            if not k.startswith(('les_charge_readout.', 'les_lr_energy.')):
+                dst_sd[k] = src_sd[k]
+        m.load_state_dict(dst_sd, strict=True)
+        return m
+
+    def test_lr_changes_force(self, les_model_lr, les_model_sr_only, nacl_graph):
+        for m in (les_model_lr, les_model_sr_only):
+            m.eval()
+            m.set_is_batch_data(False)
+        f_lr = les_model_lr(_fresh(nacl_graph))[KEY.PRED_FORCE]
+        f_sr = les_model_sr_only(_fresh(nacl_graph))[KEY.PRED_FORCE]
+        diff = (f_lr - f_sr).abs().max().item()
+        assert diff > 1e-5, (
+            f'LR term should contribute non-trivially to forces; max diff = {diff:.2e}'
+        )
+
+    def test_lr_changes_stress(self, les_model_lr, les_model_sr_only, nacl_graph):
+        for m in (les_model_lr, les_model_sr_only):
+            m.eval()
+            m.set_is_batch_data(False)
+        s_lr = les_model_lr(_fresh(nacl_graph))[KEY.PRED_STRESS]
+        s_sr = les_model_sr_only(_fresh(nacl_graph))[KEY.PRED_STRESS]
+        diff = (s_lr - s_sr).abs().max().item()
+        assert diff > 1e-5, (
+            f'LR term should contribute non-trivially to stress; max diff = {diff:.2e}'
+        )
 
 
 # ── multi-charge channels ──────────────────────────────────────────────────────

@@ -112,6 +112,52 @@ class TestBuildModelWithLES:
             assert torch.allclose(les_sd[key].cpu().float(), orig_val.float()), \
                 f'SR param {key!r} changed during build_model_with_les'
 
+    def test_is_batch_data_propagates(self, les_model):
+        """set_is_batch_data must reach top-level LES modules.
+
+        Regression guard for the IrrepsLinear-based readout: removing the
+        _is_batch_data property from LatentChargeReadout must not break
+        propagation to other top-level layers.
+        """
+        les_model.set_is_batch_data(False)
+        for name in ('edge_preprocess', 'les_lr_energy', 'force_output'):
+            assert les_model._modules[name]._is_batch_data is False, (
+                f'{name}._is_batch_data not set to False'
+            )
+
+        les_model.set_is_batch_data(True)
+        for name in ('edge_preprocess', 'les_lr_energy', 'force_output'):
+            assert les_model._modules[name]._is_batch_data is True, (
+                f'{name}._is_batch_data not restored to True'
+            )
+
+    def test_state_dict_round_trip(self, les_model, omni_checkpoint, nacl_graph):
+        """state_dict() → load_state_dict() must reproduce identical output."""
+        sd = les_model.state_dict()
+        model2 = omni_checkpoint.build_model_with_les(
+            les_config={
+                'les_args': {'use_atomwise': False},
+                'zero_init': True,
+            },
+            freeze_sr=True,
+        ).to(DEVICE)
+        missing, unexpected = model2.load_state_dict(sd, strict=True)
+        assert not missing, f'Unexpected missing keys: {missing}'
+        assert not unexpected, f'Unexpected extra keys: {unexpected}'
+
+        for m in (les_model, model2):
+            m.eval()
+            m.set_is_batch_data(False)
+        out1 = les_model(nacl_graph.clone())
+        out2 = model2(nacl_graph.clone())
+        assert torch.allclose(
+            out1[KEY.PRED_TOTAL_ENERGY], out2[KEY.PRED_TOTAL_ENERGY], atol=1e-6
+        )
+        assert torch.allclose(
+            out1[KEY.PRED_FORCE], out2[KEY.PRED_FORCE], atol=1e-6
+        )
+        les_model.set_is_batch_data(True)  # restore
+
 
 class TestParameterFreezing:
     def test_les_params_require_grad(self, les_model):
@@ -185,11 +231,19 @@ class TestInference:
             assert torch.isfinite(s).all(), f'Stress contains NaN/Inf: {s}'
 
     def test_lr_energy_zero_at_init(self, les_model, nacl_graph):
-        """With zero-init les_charge_readout, LR charges = 0 → E_LR ≈ 0."""
+        """With zero-init les_charge_readout, LR charges = 0 → E_LR ≈ 0.
+
+        Also verifies that LR_ENERGY is a scalar in non-batch mode so that
+        AddLREnergy(SR_ENERGY + LR_ENERGY) does not silently broadcast.
+        """
         les_model.eval()
         out = les_model(nacl_graph)
         e_lr = out.get(KEY.LR_ENERGY)
         if e_lr is not None:
+            assert e_lr.shape == (), (
+                f'LR_ENERGY should be scalar in non-batch mode, '
+                f'got shape {tuple(e_lr.shape)}'
+            )
             assert torch.allclose(e_lr, torch.zeros_like(e_lr), atol=1e-6), \
                 f'E_LR should be ~0 with zero-init charges, got {e_lr}'
 
