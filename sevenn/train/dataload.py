@@ -243,10 +243,14 @@ def graph_build(
         y_from_calc (bool): Get reference y labels from calculator, defaults to False
     Returns:
         List[AtomGraphData]: list of AtomGraphData
+
+    Note: with_shift=True is hard-wired so KEY.CELL / KEY.CELL_SHIFT are
+    always present in graph data — required by LES models, harmless for
+    non-LES models (the keys are simply never read).
     """
     serial = num_cores == 1
     inputs = [
-        (atoms, cutoff, transfer_info, y_from_calc, allow_unlabeled)
+        (atoms, cutoff, transfer_info, y_from_calc, allow_unlabeled, True)
         for atoms in atoms_list
     ]
 

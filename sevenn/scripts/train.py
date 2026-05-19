@@ -78,17 +78,28 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
     model = build_E3_equivariant_model(config)
     log.print_model_info(model, config)
 
-    # LES fine-tuning: optionally freeze all non-LES parameters so the
-    # Trainer's requires_grad filter only optimises les_charge_readout and
-    # les_lr_energy.  Must happen before Trainer.from_config captures params.
-    if config.get(KEY.USE_LES, False) and config.get(
-        KEY.LES_CONFIG, {}
-    ).get('freeze_sr', False):
-        les_module_names = {'les_charge_readout', 'les_lr_energy'}
-        for name, param in model.named_parameters():
-            if name.split('.')[0] not in les_module_names:
-                param.requires_grad_(False)
-        log.writeline('LES fine-tuning: SR parameters frozen (freeze_sr=True).')
+    # LES fine-tuning: zero_init=True locks q=0, so dE_LR/dq=0 forever and
+    # the readout never escapes; combined with freeze_sr=True nothing trains.
+    if config.get(KEY.USE_LES, False):
+        les_cfg = config.get(KEY.LES_CONFIG, {})
+        zero_init = les_cfg.get('zero_init', False)
+        freeze_sr = les_cfg.get('freeze_sr', False)
+        if zero_init and freeze_sr:
+            raise ValueError(
+                'zero_init=True + freeze_sr=True is a no-op (q stuck at 0, '
+                'SR frozen). Set one of them to False.'
+            )
+        if zero_init:
+            log.writeline(
+                'WARNING: zero_init=True locks q=0 forever; the LR branch '
+                'will not train. Only SR weights move.'
+            )
+        if freeze_sr:
+            les_module_names = {'les_charge_readout', 'les_lr_energy'}
+            for name, param in model.named_parameters():
+                if name.split('.')[0] not in les_module_names:
+                    param.requires_grad_(False)
+            log.writeline('LES fine-tuning: SR parameters frozen (freeze_sr=True).')
 
     trainer = Trainer.from_config(model, config)
     if state_dicts:

@@ -600,3 +600,104 @@ class TestMultiCharge:
         les_model_mq.zero_grad()
         out = les_model_mq(_fresh(nacl_graph))
         (out[KEY.PRED_TOTAL_ENERGY].sum() + out[KEY.PRED_FORCE].sum()).backward()
+
+
+# ── Ewald summation physics ───────────────────────────────────────────────────
+
+class TestEwaldPhysics:
+    """
+    Physics-level sanity checks on the Ewald sum itself.
+
+    Tests that probe the analytic structure of Coulomb interactions:
+      - translation invariance        (PBC handled correctly)
+      - quadratic scaling in q        (E ~ Σ qᵢqⱼ / rᵢⱼ)
+      - sign invariance E(-q) = E(q)  (q² symmetry)
+      - zero-charge ⇒ zero-energy
+
+    For the scaling/sign/zero tests, LatentEwaldSum is invoked directly with
+    synthetic q to isolate Ewald physics from the GNN's charge readout.
+    """
+
+    @pytest.fixture(scope='class')
+    def ewald_module(self):
+        """Bare LatentEwaldSum in non-batch mode."""
+        from sevenn.nn.les import LatentEwaldSum
+        m = LatentEwaldSum()
+        m._is_batch_data = False
+        m.eval()
+        return m
+
+    @staticmethod
+    def _ewald_data(graph, q):
+        """Minimal data dict for direct LatentEwaldSum invocation."""
+        return {
+            KEY.POS: graph[KEY.POS].clone(),
+            KEY.CELL: graph[KEY.CELL].clone(),
+            KEY.LES_Q: q,
+        }
+
+    def test_translation_invariance(self, les_model, nacl_graph):
+        """
+        Uniform shift of all positions must leave E_LR unchanged.
+
+        Under a pure translation Δ:
+          - edge_vec = pos[dst] - pos[src] + S·cell is invariant (so SR q is too)
+          - Ewald structure factor: |Σ qᵢ exp(i k·(rᵢ+Δ))|² = |S(k)|²  ✓
+        Any failure here points to broken PBC handling inside Les().
+        """
+        les_model.eval()
+        les_model.set_is_batch_data(False)
+
+        e0 = les_model(_fresh(nacl_graph))[KEY.LR_ENERGY].detach().item()
+
+        shifted = _fresh(nacl_graph)
+        shifted[KEY.POS] = shifted[KEY.POS] + torch.tensor([0.3, -0.7, 1.1])
+        e1 = les_model(shifted)[KEY.LR_ENERGY].detach().item()
+
+        # Use a meaningful tolerance: energy scale of E_LR, not absolute.
+        scale = max(abs(e0), 1e-6)
+        assert abs(e0 - e1) / scale < 1e-3, (
+            f'E_LR not translation-invariant: '
+            f'E(pos) = {e0:.6e}, E(pos+Δ) = {e1:.6e}, ΔE/E = {(e0-e1)/scale:.3e}'
+        )
+
+    def test_quadratic_in_charge(self, ewald_module, nacl_graph):
+        """E_LR(α·q) = α²·E_LR(q): Coulomb is bilinear in charges."""
+        n = int(nacl_graph[KEY.NUM_ATOMS].item())
+        q = torch.linspace(-0.4, 0.4, n).unsqueeze(-1)
+        q = q - q.mean()  # enforce charge neutrality
+
+        e1 = ewald_module(self._ewald_data(nacl_graph, q))[KEY.LR_ENERGY].item()
+
+        alpha = 2.5
+        e2 = ewald_module(
+            self._ewald_data(nacl_graph, alpha * q)
+        )[KEY.LR_ENERGY].item()
+
+        expected = alpha ** 2 * e1
+        rel_err = abs(e2 - expected) / max(abs(expected), 1e-12)
+        assert rel_err < 1e-4, (
+            f'Ewald not quadratic in q: E(αq) = {e2:.6e}, '
+            f'α²·E(q) = {expected:.6e}, rel_err = {rel_err:.3e}'
+        )
+
+    def test_sign_invariance(self, ewald_module, nacl_graph):
+        """E_LR(-q) = E_LR(q): Coulomb energy depends on qᵢqⱼ pairs."""
+        n = int(nacl_graph[KEY.NUM_ATOMS].item())
+        q = torch.linspace(-0.4, 0.4, n).unsqueeze(-1)
+        q = q - q.mean()
+
+        e_pos = ewald_module(self._ewald_data(nacl_graph, q))[KEY.LR_ENERGY].item()
+        e_neg = ewald_module(self._ewald_data(nacl_graph, -q))[KEY.LR_ENERGY].item()
+
+        scale = max(abs(e_pos), 1e-6)
+        assert abs(e_pos - e_neg) / scale < 1e-5, (
+            f'E(-q) ≠ E(q): {e_pos:.6e} vs {e_neg:.6e}'
+        )
+
+    def test_zero_charge_zero_energy(self, ewald_module, nacl_graph):
+        """q = 0 must give E_LR = 0 (no charge → no Coulomb)."""
+        n = int(nacl_graph[KEY.NUM_ATOMS].item())
+        q = torch.zeros(n, 1)
+        e = ewald_module(self._ewald_data(nacl_graph, q))[KEY.LR_ENERGY].item()
+        assert abs(e) < 1e-10, f'E_LR(q=0) should be 0, got {e:.3e}'

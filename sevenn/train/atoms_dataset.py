@@ -88,7 +88,8 @@ class SevenNetAtomsDataset(torch.utils.data.Dataset):
 
     def _graph_build(self, atoms: Atoms) -> Dict[str, Any]:
         return dataload.atoms_to_graph(
-            atoms, self.cutoff, transfer_info=False, y_from_calc=False
+            atoms, self.cutoff, transfer_info=False, y_from_calc=False,
+            with_shift=True,
         )
 
     def __len__(self):
