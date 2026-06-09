@@ -44,15 +44,17 @@ model:
     # ----------------------------------------------------------------------
     use_les: True                                 # Master switch: enable the long-range LES branch.
     les_config:
-        # kwargs forwarded verbatim to the external `les.Les(...)` object.
         les_args:
-            use_atomwise: False                   # False -> global Ewald sum (standard LES).
-        n_charges: 1                              # Number of latent charge channels per atom. Increase for richer LR.
-        hidden_channels: []                       # Hidden widths of the charge-readout MLP. [] -> single IrrepsLinear layer.
-                                                  #   e.g. [128] adds one hidden layer.
-        zero_init: False                          # MUST be False for real training.
-        freeze_sr: False                          # False -> train SR + LES jointly (training from scratch).
-        compute_bec: False                        # Compute Born effective charges (BEC). NOT implemented yet.
+            use_atomwise: False                   # MUST be False.
+            sigma: 1.0                            # Default: Gaussian width per atom (Angstrom) for the Ewald split.
+            dl: 2.0                               # Default: Reciprocal-space grid resolution (smaller = finer/ more k-points).
+            remove_self_interaction: True         # Default: Subtract each charge's self-energy.
+
+        n_charges: 1                              # Default: Number of latent charge channels per atom. Increase for richer LR.
+        hidden_channels: []                       # Default: Hidden widths of the charge-readout MLP. [] -> single IrrepsLinear layer.
+        zero_init: False                          # Default: MUST be False for real training.
+        freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
+        compute_bec: False                        # Default: Compute Born effective charges (BEC). NOT implemented yet.
         #bec_output_index: 0             
 
 train:
