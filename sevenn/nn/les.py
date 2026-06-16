@@ -152,23 +152,40 @@ class LatentEwaldSum(nn.Module):
         data_key_out: str = KEY.LR_ENERGY,
         compute_bec: bool = False,
         bec_output_index: Optional[int] = None,
+        batched_ewald: bool = True,
     ):
         super().__init__()
-        try:
-            from les import Les  # https://github.com/ChengUCB/les
-        except ImportError as e:
-            raise ImportError(
-                "The 'les' package is required for LES support. "
-                "Install it with: pip install git+https://github.com/ChengUCB/les.git"
-            ) from e
-
         if les_args is None:
             les_args = {'use_atomwise': False}
         self.key_input = data_key_in
         self.key_output = data_key_out
         self.compute_bec = compute_bec
         self.bec_output_index = bec_output_index
-        self.les = Les(les_args)
+        if compute_bec:
+            raise ValueError(
+                'compute_bec=True is not supported'
+            )
+        self.batched_ewald = batched_ewald
+        if self.batched_ewald:
+            from .ewald import BatchedEwald
+            self.ewald = BatchedEwald(
+                dl=les_args.get('dl', 2.0),
+                sigma=les_args.get('sigma', 1.0),
+                remove_self_interaction=les_args.get(
+                    'remove_self_interaction', True
+                ),
+            )
+        else:
+            try:
+                from les import Les  # https://github.com/ChengUCB/les
+            except ImportError as e:
+                raise ImportError(
+                    "The 'les' package is required for LES BEC support. "
+                    "Install it with: "
+                    "pip install git+https://github.com/ChengUCB/les.git"
+                    "or just set batched_ewald=True to use the native kernel"
+                ) from e
+            self.les = Les(les_args)
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
@@ -190,26 +207,29 @@ class LatentEwaldSum(nn.Module):
         else:
             cell = torch.zeros((n_graphs, 3, 3), device=pos.device, dtype=pos.dtype)
 
-        les_result = self.les(
-            latent_charges=q,
-            positions=pos,
-            batch=batch,
-            cell=cell,
-            compute_energy=True,
-            compute_bec=self.compute_bec,
-            bec_output_index=self.bec_output_index,
-        )
+        if self.batched_ewald:
+            # Native batched reciprocal-space sum (no per-structure loop).
+            e_lr = self.ewald(q=q, r=pos, cell=cell, batch=batch)  # (n_graphs,)
+        else:
+            les_result = self.les(
+                latent_charges=q,
+                positions=pos,
+                batch=batch,
+                cell=cell,
+                compute_energy=True,
+                compute_bec=self.compute_bec,
+                bec_output_index=self.bec_output_index,
+            )
+            e_lr = les_result['E_lr']  # (n_graphs,)
+            if self.compute_bec:
+                bec = les_result.get('BEC')
+                if bec is not None:
+                    data[KEY.LES_BEC] = bec
 
-        e_lr = les_result['E_lr']  # (n_graphs,)
         assert e_lr is not None
 
         # Non-batch mode: squeeze to scalar to match SR_ENERGY from AtomReduce.
         data[self.key_output] = e_lr if self._is_batch_data else e_lr.squeeze()
-
-        if self.compute_bec:
-            bec = les_result.get('BEC')
-            if bec is not None:
-                data[KEY.LES_BEC] = bec
 
         return data
 

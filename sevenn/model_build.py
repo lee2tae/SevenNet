@@ -651,6 +651,7 @@ def build_E3_equivariant_model(
                     data_key_out=KEY.LR_ENERGY,
                     compute_bec=les_cfg.get('compute_bec', False),
                     bec_output_index=les_cfg.get('bec_output_index', None),
+                    batched_ewald=les_cfg.get('batched_ewald', True),
                 ),
                 # Total = SR + LR
                 'add_lr_to_total': AddLREnergy(
