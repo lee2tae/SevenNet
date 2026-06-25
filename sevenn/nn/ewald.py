@@ -80,26 +80,35 @@ class BatchedEwald(nn.Module):
         )                                                                  # [P]
 
         valid = box_mask & spherical & hemisphere.unsqueeze(0)             # [G,P]
+
+        # drop k-points unused by every graph
+        keep = valid.any(dim=0)                            # [P]
+        kvec = kvec[:, keep]                               # [G,P',3]
+        k_sq = k_sq[:, keep]                               # [G,P']
+        valid = valid[:, keep]                             # [G,P']
+        factors = factors[keep]                            # [P']
+        P = kvec.shape[1]
+
         validf = valid.to(dtype)
 
         # --- structure factor S(k) = sum_atoms q * e^{i k.r}, scattered by graph ---
-        kvec_atom = kvec[batch]                            # [N,P,3]
-        k_dot_r = torch.einsum('nd,npd->np', r, kvec_atom)  # [N,P]
-        cos = torch.cos(k_dot_r)                           # [N,P]
-        sin = torch.sin(k_dot_r)                           # [N,P]
+        kvec_atom = kvec[batch]                            # [N,P',3]
+        k_dot_r = torch.einsum('nd,npd->np', r, kvec_atom)  # [N,P']
+        cos = torch.cos(k_dot_r)                           # [N,P']
+        sin = torch.sin(k_dot_r)                           # [N,P']
 
-        qc = q.unsqueeze(2) * cos.unsqueeze(1)             # [N,n_q,P]
-        qs = q.unsqueeze(2) * sin.unsqueeze(1)             # [N,n_q,P]
+        qc = q.unsqueeze(2) * cos.unsqueeze(1)             # [N,n_q,P']
+        qs = q.unsqueeze(2) * sin.unsqueeze(1)             # [N,n_q,P']
         S_real = torch.zeros(n_graphs, n_q, P, device=device, dtype=dtype)
         S_imag = torch.zeros(n_graphs, n_q, P, device=device, dtype=dtype)
         S_real.index_add_(0, batch, qc)                    # scatter over atoms
         S_imag.index_add_(0, batch, qs)
-        S_sq = S_real ** 2 + S_imag ** 2                   # [G,n_q,P]
+        S_sq = S_real ** 2 + S_imag ** 2                   # [G,n_q,P']
 
         # --- assemble potential: (1/V) sum_k factors * exp(-s^2 k^2/2)/k^2 * |S|^2 ---
         k_sq_safe = torch.where(valid, k_sq, torch.ones_like(k_sq))   # avoid /0
-        kfac = torch.exp(-self.sigma_sq_half * k_sq) / k_sq_safe      # [G,P]
-        weight = factors.unsqueeze(0) * kfac * validf                # [G,P]
+        kfac = torch.exp(-self.sigma_sq_half * k_sq) / k_sq_safe      # [G,P']
+        weight = factors.unsqueeze(0) * kfac * validf                # [G,P']
         volume = torch.linalg.det(cell)                              # [G]  signed
         pot = (weight.unsqueeze(1) * S_sq).sum(dim=2) / volume.unsqueeze(1)  # [G,n_q]
 
