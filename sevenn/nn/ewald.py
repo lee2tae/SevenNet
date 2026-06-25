@@ -120,3 +120,116 @@ class BatchedEwald(nn.Module):
 
         pot = pot * self.norm_factor                                 # [G,n_q]
         return pot.sum(dim=1)                                        # [G]
+
+
+class HybridBatchedEwald(nn.Module):
+    """
+    Adaptive wrapper: keeps small/normal cells together as the bulk and 
+    recursively peels the largest into further groups
+    """
+
+    def __init__(
+        self,
+        dl: float = 2.0,
+        sigma: float = 1.0,
+        remove_self_interaction: bool = True,
+        norm_factor: float = 90.4756,
+        mem_budget: Optional[int] = None,
+        safety: float = 0.8,
+    ):
+        super().__init__()
+        self.dl = dl
+        self.mem_budget = mem_budget
+        self.safety = safety
+        self.core = BatchedEwald(dl, sigma, remove_self_interaction, norm_factor)
+
+    def _grid_Pprime(self, cell: torch.Tensor) -> int:
+        device, dtype = cell.device, cell.dtype
+        G = self.core.twopi * torch.linalg.inv(cell).transpose(1, 2)
+        Nk = torch.clamp((torch.norm(cell, dim=2) / self.dl).to(torch.int64), min=1)
+        Nm = Nk.max(0).values
+        ax = [torch.arange(-int(Nm[i]), int(Nm[i]) + 1, device=device) for i in range(3)]
+        nvec = torch.stack(torch.meshgrid(*ax, indexing='ij'), -1).reshape(-1, 3).to(dtype)
+        ksq = (torch.einsum('pd,gde->gpe', nvec, G) ** 2).sum(-1)
+        box = (nvec.abs().unsqueeze(0) <= Nk.unsqueeze(1)).all(2)
+        sph = (ksq > 0) & (ksq <= self.core.k_sq_max)
+        nz = (nvec != 0).to(torch.int64)
+        sign = torch.gather(nvec, 1, torch.argmax(nz, 1).unsqueeze(1)).squeeze(1)
+        hemi = (sign > 0) | (nvec == 0).all(1)
+        return int((box & sph & hemi.unsqueeze(0)).any(0).sum())
+
+    def _budget(self, device: torch.device) -> float:
+        if self.mem_budget is not None:
+            return float(self.mem_budget)
+        if device.type == 'cuda':
+            free, _ = torch.cuda.mem_get_info(device)
+            return self.safety * free
+        return float('inf')
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        r: torch.Tensor,
+        cell: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        N, n_q = r.shape[0], q.shape[1]
+        device, dtype = r.device, r.dtype
+        if batch is None:
+            batch = torch.zeros(N, dtype=torch.long, device=device)
+        n_graphs = cell.shape[0]
+
+        # gate: estimate peak from N * P' (no [N,P] tensor built)
+        Pp = self._grid_Pprime(cell)
+        planes = 6 + 2 * n_q
+        autograd = 2 if torch.is_grad_enabled() else 1
+        const = planes * r.element_size() * autograd
+        budget = self._budget(device)
+        if N * Pp * const <= budget:
+            return self.core(q=q, r=r, cell=cell, batch=batch)
+
+        # fallback: tier cells into budget-fitting groups by recursively
+        Nk = torch.clamp((torch.norm(cell, dim=2) / self.dl).to(torch.int64), min=1)
+        natoms = torch.bincount(batch, minlength=n_graphs)
+        dense = (2 * Nk + 1).prod(1)
+        ratio = Pp / float((2 * Nk.max(0).values + 1).prod())
+
+        def fits(mask: torch.Tensor) -> bool:
+            gi = mask.nonzero(as_tuple=True)[0]
+            p = float((2 * Nk[gi].max(0).values + 1).prod()) * ratio
+            return float(natoms[gi].sum()) * p * const <= budget
+
+        gid = torch.full((n_graphs,), -1, dtype=torch.long, device=device)
+        remaining = torch.ones(n_graphs, dtype=torch.bool, device=device)
+        g = 0
+        while remaining.any():
+            in_bulk = remaining.clone()
+            rem = remaining.nonzero(as_tuple=True)[0]
+            order = rem[torch.argsort(dense[rem], descending=True)].tolist()
+            oi = 0
+            while int(in_bulk.sum()) > 1 and not fits(in_bulk):
+                while oi < len(order) and not in_bulk[order[oi]]:
+                    oi += 1
+                if oi >= len(order):
+                    break
+                in_bulk[order[oi]] = False
+                oi += 1
+            gid[in_bulk] = g
+            remaining = remaining & ~in_bulk
+            g += 1
+        n_groups = g
+
+        atom_gid = gid[batch]
+        out_idx, out_e = [], []
+        for grp in range(n_groups):
+            graphs = (gid == grp).nonzero(as_tuple=True)[0]
+            amask = atom_gid == grp
+            remap = torch.full((n_graphs,), -1, dtype=torch.long, device=device)
+            remap[graphs] = torch.arange(graphs.shape[0], device=device)
+            e_sub = self.core(q[amask], r[amask], cell[graphs], remap[batch[amask]])
+            out_idx.append(graphs)
+            out_e.append(e_sub)
+        out = torch.zeros(n_graphs, device=device, dtype=dtype)
+        return out.index_copy(0, torch.cat(out_idx), torch.cat(out_e))

@@ -50,6 +50,7 @@ model:
             dl: 2.0                               # Default: Reciprocal-space grid resolution (smaller = finer/ more k-points).
             remove_self_interaction: True         # Default: Subtract each charge's self-energy.
 
+        ewald_type: batched                       # Default: 'batched'. | 'cheng' | 'hybrid'  
         n_charges: 1                              # Default: Number of latent charge channels per atom. Increase for richer LR.
         hidden_channels: []                       # Default: Hidden widths of the charge-readout MLP. [] -> single IrrepsLinear layer.
         zero_init: False                          # Default: MUST be False for real training.

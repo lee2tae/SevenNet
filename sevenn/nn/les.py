@@ -152,7 +152,7 @@ class LatentEwaldSum(nn.Module):
         data_key_out: str = KEY.LR_ENERGY,
         compute_bec: bool = False,
         bec_output_index: Optional[int] = None,
-        batched_ewald: bool = True,
+        ewald_type: str = 'batched',
     ):
         super().__init__()
         if les_args is None:
@@ -165,27 +165,32 @@ class LatentEwaldSum(nn.Module):
             raise ValueError(
                 'compute_bec=True is not supported'
             )
-        self.batched_ewald = batched_ewald
-        if self.batched_ewald:
+        # ewald_type: 'batched' | 'hybrid' | 'cheng'
+        self.ewald_type = ewald_type
+        self._native_ewald = ewald_type in ('batched', 'hybrid')
+        dl = les_args.get('dl', 2.0)
+        sigma = les_args.get('sigma', 1.0)
+        rsi = les_args.get('remove_self_interaction', True)
+        if ewald_type == 'batched':
             from .ewald import BatchedEwald
-            self.ewald = BatchedEwald(
-                dl=les_args.get('dl', 2.0),
-                sigma=les_args.get('sigma', 1.0),
-                remove_self_interaction=les_args.get(
-                    'remove_self_interaction', True
-                ),
+            self.ewald = BatchedEwald(dl=dl, sigma=sigma, remove_self_interaction=rsi)
+        elif ewald_type == 'hybrid':
+            from .ewald import HybridBatchedEwald
+            self.ewald = HybridBatchedEwald(
+                dl=dl, sigma=sigma, remove_self_interaction=rsi,
             )
-        else:
+        elif ewald_type == 'cheng':
             try:
                 from les import Les  # https://github.com/ChengUCB/les
             except ImportError as e:
                 raise ImportError(
-                    "The 'les' package is required for LES BEC support. "
-                    "Install it with: "
-                    "pip install git+https://github.com/ChengUCB/les.git"
-                    "or just set batched_ewald=True to use the native kernel"
+                    "The 'les' package is required for ewald_type='cheng'. "
+                    "Install it"
+                    "or use ewald_type='batched'/'hybrid' for the native kernel"
                 ) from e
             self.les = Les(les_args)
+        else:
+            raise ValueError(f'Unknown ewald_type: {ewald_type}')
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
@@ -207,7 +212,7 @@ class LatentEwaldSum(nn.Module):
         else:
             cell = torch.zeros((n_graphs, 3, 3), device=pos.device, dtype=pos.dtype)
 
-        if self.batched_ewald:
+        if self._native_ewald:
             # Native batched reciprocal-space sum (no per-structure loop).
             e_lr = self.ewald(q=q, r=pos, cell=cell, batch=batch)  # (n_graphs,)
         else:
