@@ -256,3 +256,83 @@ class AddLREnergy(nn.Module):
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         data[self.key_output] = data[self.key_sr] + data[self.key_lr]
         return data
+
+
+class NeutralizeCharge(nn.Module):
+    """
+    Enforce charge-neutrality constraint per graph.
+
+    Args:
+        mode:
+            'none'  → identity (skip; module not normally inserted)
+            'shift' → q_i ← q_i − ⟨q⟩_graph             (uniform shift)
+            'fukui' → q_i ← q_i − (Σq) · softplus(f_i) / Σ_j softplus(f_j)
+                      (Fukui-style redistribution; needs KEY.LES_F input)
+        data_key_q: per-atom latent charges (N, n_charges)
+        data_key_f: per-atom Fukui factor (N, 1)  [only for 'fukui']
+        eps:        denominator guard
+    """
+
+    def __init__(
+        self,
+        mode: str = 'none',
+        data_key_q: str = KEY.LES_Q,
+        data_key_f: str = KEY.LES_F,
+        eps: float = 1e-12,
+    ):
+        super().__init__()
+        if mode not in ('none', 'shift', 'fukui'):
+            raise ValueError(
+                f"Unknown neutralize_mode: {mode!r}. "
+                "Choose from 'none' | 'shift' | 'fukui'."
+            )
+        self.mode = mode
+        self.data_key_q = data_key_q
+        self.data_key_f = data_key_f
+        self.eps = eps
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+
+    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+        if self.mode == 'none':
+            return data
+
+        q = data[self.data_key_q]   # (N_atoms, n_charges)
+        if self._is_batch_data:
+            batch = data[KEY.BATCH].long()
+            n_graphs = int(batch.max().item()) + 1
+        else:
+            batch = torch.zeros(q.shape[0], dtype=torch.long, device=q.device)
+            n_graphs = 1
+
+        n_ch = q.shape[1]
+
+        if self.mode == 'shift':
+            # per-graph mean
+            sum_q = torch.zeros(n_graphs, n_ch, device=q.device, dtype=q.dtype)
+            sum_q.scatter_add_(
+                0, batch.unsqueeze(-1).expand(-1, n_ch), q
+            )
+            ones = torch.ones(q.shape[0], device=q.device, dtype=q.dtype)
+            count = torch.zeros(n_graphs, device=q.device, dtype=q.dtype)
+            count.scatter_add_(0, batch, ones)
+            mean_q = sum_q / count.clamp(min=1.0).unsqueeze(-1)
+            q = q - mean_q[batch]
+
+        elif self.mode == 'fukui':
+            f_raw = data[self.data_key_f]   # expected (N, 1) or (N,)
+            if f_raw.dim() == 1:
+                f_raw = f_raw.unsqueeze(-1)
+            f = torch.nn.functional.softplus(f_raw)   # (N, 1) positive
+
+            f_sum = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
+            f_sum.scatter_add_(0, batch.unsqueeze(-1), f)
+            q_sum = torch.zeros(n_graphs, n_ch, device=q.device, dtype=q.dtype)
+            q_sum.scatter_add_(
+                0, batch.unsqueeze(-1).expand(-1, n_ch), q
+            )
+            # ratio (N, 1) broadcasts over n_ch
+            ratio = f / (f_sum[batch] + self.eps)
+            q = q - q_sum[batch] * ratio
+
+        data[self.data_key_q] = q
+        return data

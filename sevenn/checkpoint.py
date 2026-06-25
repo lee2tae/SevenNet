@@ -474,7 +474,9 @@ class SevenNetCheckpoint:
 
         # Only LES-specific keys should be absent from the pretrained checkpoint.
         # Any other missing key means an unexpected model mismatch.
-        les_prefixes = ('les_charge_readout.', 'les_lr_energy.')
+        les_prefixes = (
+            'les_charge_readout.', 'les_lr_energy.', 'les_fukui_readout.',
+        )
         unexpected_missing = [
             k for k in missing if not k.startswith(les_prefixes)
         ]
@@ -496,7 +498,9 @@ class SevenNetCheckpoint:
             )
 
         if freeze_sr:
-            les_module_names = {'les_charge_readout', 'les_lr_energy'}
+            les_module_names = {
+                'les_charge_readout', 'les_lr_energy', 'les_fukui_readout'
+            }
             for name, param in model.named_parameters():
                 if name.split('.')[0] not in les_module_names:
                     param.requires_grad_(False)

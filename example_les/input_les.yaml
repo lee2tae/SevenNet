@@ -54,6 +54,12 @@ model:
         n_charges: 1                              # Default: Number of latent charge channels per atom. Increase for richer LR.
         hidden_channels: []                       # Default: Hidden widths of the charge-readout MLP. [] -> single IrrepsLinear layer.
         zero_init: False                          # Default: MUST be False for real training.
+
+        # Charge neutralization: enforce per-graph total charge = 0 before the Ewald sum.
+        neutralize_mode: fukui                    # Default: 'none'. | 'shift' (subtract per-graph mean) | 'fukui' (learned redistribution)
+        fukui_hidden_channels: []                 # 'fukui' only: hidden widths of the Fukui-weight readout MLP. [] -> single IrrepsLinear.
+        fukui_zero_init: False                    # 'fukui' only: zero-init the Fukui readout.
+
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
         compute_bec: False                        # Default: Compute Born effective charges (BEC). NOT implemented yet.
         #bec_output_index: 0             

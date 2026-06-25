@@ -60,6 +60,7 @@ PRED_TOTAL_ENERGY: Final[str] = 'inferred_total_energy'
 
 # LES (Latent Ewald Summation) outputs
 LES_Q: Final[str] = 'les_latent_charge'           # (N_atoms, n_charges) per-atom latent charges
+LES_F: Final[str] = 'les_fukui_factor'             # (N_atoms, 1) Fukui-style redistribution weight
 SR_ENERGY: Final[str] = 'les_sr_energy'            # (n_graphs,) short-range energy sum
 LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewald energy
 LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges

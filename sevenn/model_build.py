@@ -33,6 +33,7 @@ from .nn.les import (
     AddLREnergy,
     LatentChargeReadout,
     LatentEwaldSum,
+    NeutralizeCharge,
 )
 from .nn.sequential import AtomGraphSequential
 
@@ -632,6 +633,20 @@ def build_E3_equivariant_model(
             hidden_channels=les_cfg.get('hidden_channels', None),
             zero_init=les_cfg.get('zero_init', False),
         )
+
+        # Charge-neutralization
+        _neutral = les_cfg.get('neutralize_mode', 'none')
+        if _neutral == 'fukui':
+            layers['les_fukui_readout'] = LatentChargeReadout(
+                irreps_in=irreps_x,  # type: ignore
+                data_key_in=KEY.NODE_FEATURE,
+                data_key_out=KEY.LES_F,
+                n_charges=1,
+                hidden_channels=les_cfg.get('fukui_hidden_channels', None),
+                zero_init=les_cfg.get('fukui_zero_init', False),
+            )
+        if _neutral != 'none':
+            layers['les_neutralize'] = NeutralizeCharge(mode=_neutral)
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
