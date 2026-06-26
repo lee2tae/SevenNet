@@ -233,3 +233,183 @@ class HybridBatchedEwald(nn.Module):
             out_e.append(e_sub)
         out = torch.zeros(n_graphs, device=device, dtype=dtype)
         return out.index_copy(0, torch.cat(out_idx), torch.cat(out_e))
+
+
+class FlatBatchedEwald(nn.Module):
+    """
+    k-points are flattened for batch computation.
+    """
+
+    def __init__(
+        self,
+        dl: float = 2.0,
+        sigma: float = 1.0,
+        remove_self_interaction: bool = True,
+        norm_factor: float = 90.4756,
+    ):
+        super().__init__()
+        self.dl = dl
+        self.sigma = sigma
+        self.sigma_sq_half = sigma ** 2 / 2.0
+        self.remove_self_interaction = remove_self_interaction
+        self.norm_factor = norm_factor
+        self.twopi = 2.0 * torch.pi
+        self.k_sq_max = (self.twopi / self.dl) ** 2
+
+    def forward(
+        self,
+        q: torch.Tensor,                       # [N, n_q] or [N]
+        r: torch.Tensor,                       # [N, 3]
+        cell: torch.Tensor,                    # [n_graphs, 3, 3]
+        batch: Optional[torch.Tensor] = None,  # [N]
+    ) -> torch.Tensor:                         # [n_graphs]
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        N = r.shape[0]
+        device, dtype = r.device, r.dtype
+        if batch is None:
+            batch = torch.zeros(N, dtype=torch.long, device=device)
+        n_graphs = cell.shape[0]
+        n_q = q.shape[1]
+
+        # --- reciprocal lattice vectors (kept differentiable in `cell`) ---
+        cell_inv = torch.linalg.inv(cell)                 # [G,3,3]
+        G = self.twopi * cell_inv.transpose(1, 2)         # [G,3,3]  G = 2pi (M^-1)^T
+        norms = torch.norm(cell, dim=2)                   # [G,3]  |a_i| per structure
+        Nk = torch.clamp((norms / self.dl).to(torch.int64), min=1)   # [G,3]
+
+        # --- enumerate each graph's own [-Nk,Nk] box ---
+        dims = 2 * Nk + 1                                  # [G,3]  box size per axis
+        Pbox = dims.prod(1)                                # [G]    candidates per graph
+        kgraph = torch.repeat_interleave(                  # [M0]  graph of each candidate
+            torch.arange(n_graphs, device=device), Pbox
+        )
+        box_off = torch.cumsum(Pbox, 0) - Pbox             # [G]
+        box_local = torch.arange(kgraph.shape[0], device=device) - box_off[kgraph]
+        dg = dims[kgraph]                                  # [M0,3]
+        i0 = box_local // (dg[:, 1] * dg[:, 2])            # decode flat idx -> (i0,i1,i2)
+        rem = box_local % (dg[:, 1] * dg[:, 2])
+        i1 = rem // dg[:, 2]
+        i2 = rem % dg[:, 2]
+        nvec = (torch.stack([i0, i1, i2], -1) - Nk[kgraph]).to(dtype)  # [M0,3] in [-Nk,Nk]
+
+        kvec = torch.einsum('md,mde->me', nvec, G[kgraph])  # [M0,3]
+        k_sq = (kvec ** 2).sum(dim=-1)                      # [M0]
+
+        # --- validity: spherical cutoff AND hemisphere (box holds by construction) ---
+        spherical = (k_sq > 0) & (k_sq <= self.k_sq_max)
+        non_zero = (nvec != 0).to(torch.int64)
+        first_nz = torch.argmax(non_zero, dim=1)
+        sign = torch.gather(nvec, 1, first_nz.unsqueeze(1)).squeeze(1)
+        all_zero = (nvec == 0).all(dim=1)
+        hemisphere = (sign > 0) | all_zero
+        factors = torch.where(all_zero, torch.ones_like(k_sq),
+                              torch.full_like(k_sq, 2.0))
+        keep = spherical & hemisphere                      # [M0]
+
+        # --- ragged k-list ---
+        kgraph = kgraph[keep]
+        kvec_flat = kvec[keep]                             # [M,3]
+        k_sq_flat = k_sq[keep]                             # [M]
+        factors_flat = factors[keep]                       # [M]
+
+        # --- within-graph (atom, k-point) pairs (atoms contiguous by graph) ---
+        na = torch.bincount(batch, minlength=n_graphs)             # [G]
+        atom_off = torch.cumsum(na, 0) - na                        # [G]
+        counts = na[kgraph]                                        # [M]  atoms per k-point
+        base = torch.repeat_interleave(atom_off[kgraph], counts)   # [P_tot]
+        block_off = torch.cumsum(counts, 0) - counts
+        local = torch.arange(base.shape[0], device=device) \
+            - torch.repeat_interleave(block_off, counts)
+        a_idx = (base + local).to(torch.int32)                     # [P_tot]
+
+        # --- structure factor over contiguous k-blocks (no per-pair k index) ---
+        kvec_pair = torch.repeat_interleave(kvec_flat, counts, dim=0)  # [P_tot,3]
+        phase = (r[a_idx] * kvec_pair).sum(-1)                     # [P_tot]
+        qa = q[a_idx]                                              # [P_tot,n_q]
+        S_real = torch.segment_reduce(
+            qa * torch.cos(phase).unsqueeze(-1), 'sum', lengths=counts)  # [M,n_q]
+        S_imag = torch.segment_reduce(
+            qa * torch.sin(phase).unsqueeze(-1), 'sum', lengths=counts)
+        S_sq = S_real ** 2 + S_imag ** 2                          # [M,n_q]
+
+        # --- assemble per-graph potential (k_sq_flat > 0 guaranteed) ---
+        kfac = torch.exp(-self.sigma_sq_half * k_sq_flat) / k_sq_flat
+        weight = (factors_flat * kfac).unsqueeze(-1)              # [M,1]
+        pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+        pot.index_add_(0, kgraph, weight * S_sq)                  # [G,n_q]
+        volume = torch.linalg.det(cell)
+        pot = pot / volume.unsqueeze(1)
+
+        if self.remove_self_interaction:
+            q_sq_tot = torch.zeros(n_graphs, device=device, dtype=dtype)
+            q_sq_tot.index_add_(0, batch, (q ** 2).sum(dim=1))
+            pot = pot - (q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)).unsqueeze(1)
+        return (pot * self.norm_factor).sum(dim=1)
+
+
+class AutoBatchedEwald(nn.Module):
+    """
+    Per-batch dispatch between BatchedEwald and FlatBatchedEwald.
+    Batched for homogeneous, Flat for heterogeneous.
+    """
+
+    def __init__(
+        self,
+        dl: float = 2.0,
+        sigma: float = 1.0,
+        remove_self_interaction: bool = True,
+        norm_factor: float = 90.4756,
+        flat_overhead: float = 3.0,
+    ):
+        super().__init__()
+        self.dl = dl
+        self.flat_overhead = flat_overhead
+        self.batched = BatchedEwald(dl, sigma, remove_self_interaction, norm_factor)
+        self.flat = FlatBatchedEwald(dl, sigma, remove_self_interaction, norm_factor)
+
+    def _nkbox(self, cell: torch.Tensor) -> torch.Tensor:
+        Nk = torch.clamp((torch.norm(cell, dim=2) / self.dl).to(torch.int64), min=1)
+        return Nk
+
+    def _costs(self, cell: torch.Tensor, batch: Optional[torch.Tensor]):
+        n_graphs = cell.shape[0]
+        Nk = self._nkbox(cell)
+        Vg = (2 * Nk + 1).prod(1).to(torch.float64)
+        Vshared = Vg.max()
+        if batch is None:
+            na = torch.full((n_graphs,), 1.0, dtype=torch.float64, device=cell.device)
+        else:
+            na = torch.bincount(batch, minlength=n_graphs).to(torch.float64)
+        cost_batched = na.sum() * Vshared
+        cost_flat = self.flat_overhead * (na * Vg).sum()
+        return Vg, Vshared, cost_batched, cost_flat
+
+    def homogeneity(
+        self,
+        cell: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Diagnostic: heterogeneity ratio and the kernel it routes to."""
+        Vg, Vshared, cost_batched, cost_flat = self._costs(cell, batch)
+        return {
+            'het_ratio': (Vshared / Vg.median()).item(),
+            'cost_batched': cost_batched.item(),
+            'cost_flat': cost_flat.item(),
+            'kernel': 'flat' if cost_flat.item() < cost_batched.item() else 'batched',
+        }
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        r: torch.Tensor,
+        cell: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if batch is None or cell.shape[0] == 1:   # single structure -> homogeneous
+            return self.batched(q=q, r=r, cell=cell, batch=batch)
+        with torch.no_grad():
+            _, _, cost_batched, cost_flat = self._costs(cell, batch)
+            use_flat = bool((cost_flat < cost_batched).item())   # single sync
+        kernel = self.flat if use_flat else self.batched
+        return kernel(q=q, r=r, cell=cell, batch=batch)

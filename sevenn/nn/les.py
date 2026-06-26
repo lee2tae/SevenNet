@@ -165,15 +165,25 @@ class LatentEwaldSum(nn.Module):
             raise ValueError(
                 'compute_bec=True is not supported'
             )
-        # ewald_type: 'batched' | 'hybrid' | 'cheng'
+        # ewald_type: 'batched' | 'flat' | 'auto' | 'hybrid' | 'cheng'
         self.ewald_type = ewald_type
-        self._native_ewald = ewald_type in ('batched', 'hybrid')
+        self._native_ewald = ewald_type in ('batched', 'flat', 'auto', 'hybrid')
         dl = les_args.get('dl', 2.0)
         sigma = les_args.get('sigma', 1.0)
         rsi = les_args.get('remove_self_interaction', True)
         if ewald_type == 'batched':
             from .ewald import BatchedEwald
             self.ewald = BatchedEwald(dl=dl, sigma=sigma, remove_self_interaction=rsi)
+        elif ewald_type == 'flat':
+            from .ewald import FlatBatchedEwald
+            self.ewald = FlatBatchedEwald(
+                dl=dl, sigma=sigma, remove_self_interaction=rsi
+            )
+        elif ewald_type == 'auto':
+            from .ewald import AutoBatchedEwald
+            self.ewald = AutoBatchedEwald(
+                dl=dl, sigma=sigma, remove_self_interaction=rsi
+            )
         elif ewald_type == 'hybrid':
             from .ewald import HybridBatchedEwald
             self.ewald = HybridBatchedEwald(
