@@ -112,11 +112,11 @@ class BatchedEwald(nn.Module):
         volume = torch.linalg.det(cell)                              # [G]  signed
         pot = (weight.unsqueeze(1) * S_sq).sum(dim=2) / volume.unsqueeze(1)  # [G,n_q]
 
-        # --- self-interaction removal (matches reference: total q^2 per graph) ---
+        # --- self-interaction removal (per charge channel) ---
         if self.remove_self_interaction:
-            q_sq_tot = torch.zeros(n_graphs, device=device, dtype=dtype)
-            q_sq_tot.index_add_(0, batch, (q ** 2).sum(dim=1))        # [G]
-            pot = pot - (q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)).unsqueeze(1)
+            q_sq_tot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+            q_sq_tot.index_add_(0, batch, q ** 2)                     # [G,n_q]
+            pot = pot - q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)
 
         pot = pot * self.norm_factor                                 # [G,n_q]
         return pot.sum(dim=1)                                        # [G]
@@ -342,9 +342,9 @@ class FlatBatchedEwald(nn.Module):
         pot = pot / volume.unsqueeze(1)
 
         if self.remove_self_interaction:
-            q_sq_tot = torch.zeros(n_graphs, device=device, dtype=dtype)
-            q_sq_tot.index_add_(0, batch, (q ** 2).sum(dim=1))
-            pot = pot - (q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)).unsqueeze(1)
+            q_sq_tot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+            q_sq_tot.index_add_(0, batch, q ** 2)
+            pot = pot - q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)
         return (pot * self.norm_factor).sum(dim=1)
 
 
