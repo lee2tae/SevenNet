@@ -165,9 +165,11 @@ class LatentEwaldSum(nn.Module):
             raise ValueError(
                 'compute_bec=True is not supported'
             )
-        # ewald_type: 'batched' | 'flat' | 'auto' | 'hybrid' | 'cheng'
+        # ewald_type: 'batched' | 'flat' | 'auto' | 'triton' | 'cheng'
         self.ewald_type = ewald_type
-        self._native_ewald = ewald_type in ('batched', 'flat', 'auto', 'hybrid')
+        self._native_ewald = ewald_type in (
+            'batched', 'flat', 'auto', 'triton'
+        )
         dl = les_args.get('dl', 2.0)
         sigma = les_args.get('sigma', 1.0)
         rsi = les_args.get('remove_self_interaction', True)
@@ -184,10 +186,16 @@ class LatentEwaldSum(nn.Module):
             self.ewald = AutoBatchedEwald(
                 dl=dl, sigma=sigma, remove_self_interaction=rsi
             )
-        elif ewald_type == 'hybrid':
-            from .ewald import HybridBatchedEwald
-            self.ewald = HybridBatchedEwald(
-                dl=dl, sigma=sigma, remove_self_interaction=rsi,
+        elif ewald_type == 'triton':
+            try:
+                from .ewald import TritonEwald
+            except ImportError as e:
+                raise ImportError(
+                    "ewald_type='triton' requires the 'triton' package and a "
+                    "CUDA GPU. Install triton or use 'batched'/'flat'/'auto'."
+                ) from e
+            self.ewald = TritonEwald(
+                dl=dl, sigma=sigma, remove_self_interaction=rsi
             )
         elif ewald_type == 'cheng':
             try:

@@ -1,10 +1,320 @@
 """
-Native batched Ewald (reciprocal-space) kernel for SevenNet LES.
+Reciprocal-space Ewald kernels for SevenNet LES.
 """
 from typing import Optional
 
 import torch
 import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # triton is optional
+    _HAS_TRITON = False
+
+
+if _HAS_TRITON:
+    BLK = 128
+
+
+    # ----------------------------- forward -----------------------------
+    @triton.jit
+    def _fwd(q, r, k, kg, aoff, na, Sr, Si, M, NQ: tl.constexpr, B: tl.constexpr):
+        m = tl.program_id(0); ch = tl.program_id(1)
+        if m >= M:
+            return
+        g = tl.load(kg + m); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        kx = tl.load(k + m*3+0); ky = tl.load(k + m*3+1); kz = tl.load(k + m*3+2)
+        z = tl.zeros((), dtype=Sr.dtype.element_ty); ar = z; ai = z
+        for a in range(0, n, B):
+            o = a + tl.arange(0, B); mk = o < n; idx = a0 + o
+            rx = tl.load(r+idx*3+0, mask=mk, other=0.); ry = tl.load(r+idx*3+1, mask=mk, other=0.)
+            rz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            qa = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz
+            ar += tl.sum(tl.where(mk, qa*tl.cos(ph), z)); ai += tl.sum(tl.where(mk, qa*tl.sin(ph), z))
+        tl.store(Sr+m*NQ+ch, ar); tl.store(Si+m*NQ+ch, ai)
+
+
+    # ----------------------- first backward (VJP) -----------------------
+    @triton.jit
+    def _bwd_q(q, r, k, ba, koff, nk, dSr, dSi, dq, N, NQ: tl.constexpr, B: tl.constexpr):
+        a = tl.program_id(0); ch = tl.program_id(1)
+        if a >= N:
+            return
+        g = tl.load(ba + a); k0 = tl.load(koff + g); nn = tl.load(nk + g)
+        rx = tl.load(r+a*3+0); ry = tl.load(r+a*3+1); rz = tl.load(r+a*3+2)
+        acc = tl.zeros((), dtype=dq.dtype.element_ty)
+        for kk in range(0, nn, B):
+            o = kk + tl.arange(0, B); mk = o < nn; ki = k0 + o
+            kx = tl.load(k+ki*3+0, mask=mk, other=0.); ky = tl.load(k+ki*3+1, mask=mk, other=0.)
+            kz = tl.load(k+ki*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz
+            dr_ = tl.load(dSr+ki*NQ+ch, mask=mk, other=0.); di_ = tl.load(dSi+ki*NQ+ch, mask=mk, other=0.)
+            acc += tl.sum(tl.where(mk, dr_*tl.cos(ph)+di_*tl.sin(ph), acc*0))
+        tl.store(dq+a*NQ+ch, acc)
+
+
+    @triton.jit
+    def _bwd_r(q, r, k, ba, koff, nk, dSr, dSi, dr, N, NQ: tl.constexpr, B: tl.constexpr):
+        a = tl.program_id(0)
+        if a >= N:
+            return
+        g = tl.load(ba + a); k0 = tl.load(koff + g); nn = tl.load(nk + g)
+        rx = tl.load(r+a*3+0); ry = tl.load(r+a*3+1); rz = tl.load(r+a*3+2)
+        z = tl.zeros((), dtype=dr.dtype.element_ty); dx = z; dy = z; dz = z
+        for kk in range(0, nn, B):
+            o = kk + tl.arange(0, B); mk = o < nn; ki = k0 + o
+            kx = tl.load(k+ki*3+0, mask=mk, other=0.); ky = tl.load(k+ki*3+1, mask=mk, other=0.)
+            kz = tl.load(k+ki*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            coef = tl.zeros_like(kx)
+            for ch in range(NQ):
+                qa = tl.load(q+a*NQ+ch)
+                dr_ = tl.load(dSr+ki*NQ+ch, mask=mk, other=0.); di_ = tl.load(dSi+ki*NQ+ch, mask=mk, other=0.)
+                coef += qa*(-s*dr_ + c*di_)
+            dx += tl.sum(tl.where(mk, coef*kx, z)); dy += tl.sum(tl.where(mk, coef*ky, z))
+            dz += tl.sum(tl.where(mk, coef*kz, z))
+        tl.store(dr+a*3+0, dx); tl.store(dr+a*3+1, dy); tl.store(dr+a*3+2, dz)
+
+
+    @triton.jit
+    def _bwd_k(q, r, k, kg, aoff, na, dSr, dSi, dk, M, NQ: tl.constexpr, B: tl.constexpr):
+        m = tl.program_id(0)
+        if m >= M:
+            return
+        g = tl.load(kg + m); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        kx = tl.load(k+m*3+0); ky = tl.load(k+m*3+1); kz = tl.load(k+m*3+2)
+        z = tl.zeros((), dtype=dk.dtype.element_ty); dx = z; dy = z; dz = z
+        for a in range(0, n, B):
+            o = a + tl.arange(0, B); mk = o < n; idx = a0 + o
+            rx = tl.load(r+idx*3+0, mask=mk, other=0.); ry = tl.load(r+idx*3+1, mask=mk, other=0.)
+            rz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            coef = tl.zeros_like(rx)
+            for ch in range(NQ):
+                qa = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+                dr_ = tl.load(dSr+m*NQ+ch); di_ = tl.load(dSi+m*NQ+ch)
+                coef += qa*(-s*dr_ + c*di_)
+            dx += tl.sum(tl.where(mk, coef*rx, z)); dy += tl.sum(tl.where(mk, coef*ry, z))
+            dz += tl.sum(tl.where(mk, coef*rz, z))
+        tl.store(dk+m*3+0, dx); tl.store(dk+m*3+1, dy); tl.store(dk+m*3+2, dz)
+
+
+    # ----------------------- double backward -----------------------
+    @triton.jit
+    def _ddw_dS(q, r, k, kg, aoff, na, dSr, dSi, gdq, gdr, gdk, gSr, gSi,
+                M, NQ: tl.constexpr, B: tl.constexpr):
+        m = tl.program_id(0); ch = tl.program_id(1)
+        if m >= M:
+            return
+        g = tl.load(kg + m); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        kx = tl.load(k+m*3+0); ky = tl.load(k+m*3+1); kz = tl.load(k+m*3+2)
+        gkx = tl.load(gdk+m*3+0); gky = tl.load(gdk+m*3+1); gkz = tl.load(gdk+m*3+2)
+        z = tl.zeros((), dtype=gSr.dtype.element_ty); ar = z; ai = z
+        for a in range(0, n, B):
+            o = a + tl.arange(0, B); mk = o < n; idx = a0 + o
+            rx = tl.load(r+idx*3+0, mask=mk, other=0.); ry = tl.load(r+idx*3+1, mask=mk, other=0.)
+            rz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            grx = tl.load(gdr+idx*3+0, mask=mk, other=0.); gry = tl.load(gdr+idx*3+1, mask=mk, other=0.)
+            grz = tl.load(gdr+idx*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            D = grx*kx+gry*ky+grz*kz + gkx*rx+gky*ry+gkz*rz
+            qa = tl.load(q+idx*NQ+ch, mask=mk, other=0.); gq = tl.load(gdq+idx*NQ+ch, mask=mk, other=0.)
+            ar += tl.sum(tl.where(mk, gq*c - qa*s*D, z))
+            ai += tl.sum(tl.where(mk, gq*s + qa*c*D, z))
+        tl.store(gSr+m*NQ+ch, ar); tl.store(gSi+m*NQ+ch, ai)
+
+
+    @triton.jit
+    def _ddw_q(q, r, k, ba, koff, nk, dSr, dSi, gdr, gdk, gq_out,
+              N, NQ: tl.constexpr, B: tl.constexpr):
+        a = tl.program_id(0); ch = tl.program_id(1)
+        if a >= N:
+            return
+        g = tl.load(ba + a); k0 = tl.load(koff + g); nn = tl.load(nk + g)
+        rx = tl.load(r+a*3+0); ry = tl.load(r+a*3+1); rz = tl.load(r+a*3+2)
+        grx = tl.load(gdr+a*3+0); gry = tl.load(gdr+a*3+1); grz = tl.load(gdr+a*3+2)
+        acc = tl.zeros((), dtype=gq_out.dtype.element_ty)
+        for kk in range(0, nn, B):
+            o = kk + tl.arange(0, B); mk = o < nn; ki = k0 + o
+            kx = tl.load(k+ki*3+0, mask=mk, other=0.); ky = tl.load(k+ki*3+1, mask=mk, other=0.)
+            kz = tl.load(k+ki*3+2, mask=mk, other=0.)
+            gkx = tl.load(gdk+ki*3+0, mask=mk, other=0.); gky = tl.load(gdk+ki*3+1, mask=mk, other=0.)
+            gkz = tl.load(gdk+ki*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            D = grx*kx+gry*ky+grz*kz + gkx*rx+gky*ry+gkz*rz
+            dr_ = tl.load(dSr+ki*NQ+ch, mask=mk, other=0.); di_ = tl.load(dSi+ki*NQ+ch, mask=mk, other=0.)
+            P = -s*dr_ + c*di_
+            acc += tl.sum(tl.where(mk, P*D, acc*0))
+        tl.store(gq_out+a*NQ+ch, acc)
+
+
+    @triton.jit
+    def _ddw_r(q, r, k, ba, koff, nk, dSr, dSi, gdq, gdr, gdk, gr_out,
+              N, NQ: tl.constexpr, B: tl.constexpr):
+        a = tl.program_id(0)
+        if a >= N:
+            return
+        g = tl.load(ba + a); k0 = tl.load(koff + g); nn = tl.load(nk + g)
+        rx = tl.load(r+a*3+0); ry = tl.load(r+a*3+1); rz = tl.load(r+a*3+2)
+        grx = tl.load(gdr+a*3+0); gry = tl.load(gdr+a*3+1); grz = tl.load(gdr+a*3+2)
+        z = tl.zeros((), dtype=gr_out.dtype.element_ty); dx = z; dy = z; dz = z
+        for kk in range(0, nn, B):
+            o = kk + tl.arange(0, B); mk = o < nn; ki = k0 + o
+            kx = tl.load(k+ki*3+0, mask=mk, other=0.); ky = tl.load(k+ki*3+1, mask=mk, other=0.)
+            kz = tl.load(k+ki*3+2, mask=mk, other=0.)
+            gkx = tl.load(gdk+ki*3+0, mask=mk, other=0.); gky = tl.load(gdk+ki*3+1, mask=mk, other=0.)
+            gkz = tl.load(gdk+ki*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            D = grx*kx+gry*ky+grz*kz + gkx*rx+gky*ry+gkz*rz
+            A1 = tl.zeros_like(kx); A2 = tl.zeros_like(kx); A3 = tl.zeros_like(kx)
+            for ch in range(NQ):
+                dr_ = tl.load(dSr+ki*NQ+ch, mask=mk, other=0.); di_ = tl.load(dSi+ki*NQ+ch, mask=mk, other=0.)
+                P = -s*dr_ + c*di_; Q = c*dr_ + s*di_
+                qa = tl.load(q+a*NQ+ch); gq = tl.load(gdq+a*NQ+ch)
+                A1 += P*gq; A2 += P*qa; A3 += qa*Q
+            dx += tl.sum(tl.where(mk, A1*kx + A2*gkx - A3*D*kx, z))
+            dy += tl.sum(tl.where(mk, A1*ky + A2*gky - A3*D*ky, z))
+            dz += tl.sum(tl.where(mk, A1*kz + A2*gkz - A3*D*kz, z))
+        tl.store(gr_out+a*3+0, dx); tl.store(gr_out+a*3+1, dy); tl.store(gr_out+a*3+2, dz)
+
+
+    @triton.jit
+    def _ddw_k(q, r, k, kg, aoff, na, dSr, dSi, gdq, gdr, gdk, gk_out,
+              M, NQ: tl.constexpr, B: tl.constexpr):
+        m = tl.program_id(0)
+        if m >= M:
+            return
+        g = tl.load(kg + m); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        kx = tl.load(k+m*3+0); ky = tl.load(k+m*3+1); kz = tl.load(k+m*3+2)
+        gkx = tl.load(gdk+m*3+0); gky = tl.load(gdk+m*3+1); gkz = tl.load(gdk+m*3+2)
+        z = tl.zeros((), dtype=gk_out.dtype.element_ty); dx = z; dy = z; dz = z
+        for a in range(0, n, B):
+            o = a + tl.arange(0, B); mk = o < n; idx = a0 + o
+            rx = tl.load(r+idx*3+0, mask=mk, other=0.); ry = tl.load(r+idx*3+1, mask=mk, other=0.)
+            rz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            grx = tl.load(gdr+idx*3+0, mask=mk, other=0.); gry = tl.load(gdr+idx*3+1, mask=mk, other=0.)
+            grz = tl.load(gdr+idx*3+2, mask=mk, other=0.)
+            ph = kx*rx+ky*ry+kz*rz; c = tl.cos(ph); s = tl.sin(ph)
+            D = grx*kx+gry*ky+grz*kz + gkx*rx+gky*ry+gkz*rz
+            A1 = tl.zeros_like(rx); A2 = tl.zeros_like(rx); A3 = tl.zeros_like(rx)
+            for ch in range(NQ):
+                dr_ = tl.load(dSr+m*NQ+ch); di_ = tl.load(dSi+m*NQ+ch)
+                P = -s*dr_ + c*di_; Q = c*dr_ + s*di_
+                qa = tl.load(q+idx*NQ+ch, mask=mk, other=0.); gq = tl.load(gdq+idx*NQ+ch, mask=mk, other=0.)
+                A1 += P*gq; A2 += P*qa; A3 += qa*Q
+            dx += tl.sum(tl.where(mk, A1*rx + A2*grx - A3*D*rx, z))
+            dy += tl.sum(tl.where(mk, A1*ry + A2*gry - A3*D*ry, z))
+            dz += tl.sum(tl.where(mk, A1*rz + A2*grz - A3*D*rz, z))
+        tl.store(gk_out+m*3+0, dx); tl.store(gk_out+m*3+1, dy); tl.store(gk_out+m*3+2, dz)
+
+
+    # ----------------------- autograd wiring -----------------------
+    class _SBwd(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, dSr, dSi, q, r, k, kg, aoff, na, ba, koff, nk):
+            N, NQ = q.shape; M = k.shape[0]
+            dSr = dSr.contiguous(); dSi = dSi.contiguous()
+            dq = torch.zeros_like(q); dr = torch.zeros_like(r); dk = torch.zeros_like(k)
+            _bwd_q[(N, NQ)](q, r, k, ba, koff, nk, dSr, dSi, dq, N, NQ=NQ, B=BLK)
+            _bwd_r[(N,)](q, r, k, ba, koff, nk, dSr, dSi, dr, N, NQ=NQ, B=BLK)
+            _bwd_k[(M,)](q, r, k, kg, aoff, na, dSr, dSi, dk, M, NQ=NQ, B=BLK)
+            ctx.save_for_backward(dSr, dSi, q, r, k, kg, aoff, na, ba, koff, nk)
+            ctx.NQ = NQ
+            return dq, dr, dk
+
+        @staticmethod
+        def backward(ctx, gdq, gdr, gdk):
+            dSr, dSi, q, r, k, kg, aoff, na, ba, koff, nk = ctx.saved_tensors
+            NQ = ctx.NQ; N = q.shape[0]; M = k.shape[0]
+            gdq = gdq.contiguous(); gdr = gdr.contiguous(); gdk = gdk.contiguous()
+            gSr = torch.zeros_like(dSr); gSi = torch.zeros_like(dSi)
+            gq = torch.zeros_like(q); gr = torch.zeros_like(r); gk = torch.zeros_like(k)
+            _ddw_dS[(M, NQ)](q, r, k, kg, aoff, na, dSr, dSi, gdq, gdr, gdk, gSr, gSi, M, NQ=NQ, B=BLK)
+            _ddw_q[(N, NQ)](q, r, k, ba, koff, nk, dSr, dSi, gdr, gdk, gq, N, NQ=NQ, B=BLK)
+            _ddw_r[(N,)](q, r, k, ba, koff, nk, dSr, dSi, gdq, gdr, gdk, gr, N, NQ=NQ, B=BLK)
+            _ddw_k[(M,)](q, r, k, kg, aoff, na, dSr, dSi, gdq, gdr, gdk, gk, M, NQ=NQ, B=BLK)
+            return gSr, gSi, gq, gr, gk, None, None, None, None, None, None
+
+
+    class _SFwd(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, r, k, kg, aoff, na, ba, koff, nk):
+            N, NQ = q.shape; M = k.shape[0]
+            Sr = torch.empty(M, NQ, device=q.device, dtype=q.dtype)
+            Si = torch.empty(M, NQ, device=q.device, dtype=q.dtype)
+            _fwd[(M, NQ)](q, r, k, kg, aoff, na, Sr, Si, M, NQ=NQ, B=BLK)
+            ctx.save_for_backward(q, r, k, kg, aoff, na, ba, koff, nk)
+            return Sr, Si
+
+        @staticmethod
+        def backward(ctx, dSr, dSi):
+            q, r, k, kg, aoff, na, ba, koff, nk = ctx.saved_tensors
+            dq, dr, dk = _SBwd.apply(dSr, dSi, q, r, k, kg, aoff, na, ba, koff, nk)
+            return dq, dr, dk, None, None, None, None, None, None
+
+
+    class TritonEwald(torch.nn.Module):
+        def __init__(self, dl=2.0, sigma=1.0, remove_self_interaction=True, norm_factor=90.4756):
+            super().__init__()
+            self.dl = dl; self.sigma = sigma; self.sigma_sq_half = sigma**2/2.0
+            self.remove_self_interaction = remove_self_interaction
+            self.norm_factor = norm_factor; self.twopi = 2.0*torch.pi
+            self.k_sq_max = (self.twopi/self.dl)**2
+
+        def forward(self, q, r, cell, batch=None):
+            if q.dim() == 1:
+                q = q.unsqueeze(1)
+            N = r.shape[0]; device, dtype = r.device, r.dtype
+            if batch is None:
+                batch = torch.zeros(N, dtype=torch.long, device=device)
+            n_graphs = cell.shape[0]; n_q = q.shape[1]
+            cell_inv = torch.linalg.inv(cell)
+            Grec = self.twopi*cell_inv.transpose(1, 2)
+            Nk = torch.clamp((torch.norm(cell, dim=2)/self.dl).to(torch.int64), min=1)
+            dims = 2*Nk+1; Pbox = dims.prod(1)
+            kgraph = torch.repeat_interleave(torch.arange(n_graphs, device=device), Pbox)
+            box_off = torch.cumsum(Pbox, 0)-Pbox
+            bl = torch.arange(kgraph.shape[0], device=device)-box_off[kgraph]
+            dg = dims[kgraph]
+            i0 = bl//(dg[:, 1]*dg[:, 2]); rem = bl % (dg[:, 1]*dg[:, 2])
+            i1 = rem//dg[:, 2]; i2 = rem % dg[:, 2]
+            nvec = (torch.stack([i0, i1, i2], -1)-Nk[kgraph]).to(dtype)
+            kvec = torch.einsum('md,mde->me', nvec, Grec[kgraph])
+            k_sq = (kvec**2).sum(-1)
+            sph = (k_sq > 0) & (k_sq <= self.k_sq_max)
+            nz = (nvec != 0).to(torch.int64); fnz = torch.argmax(nz, dim=1)
+            sign = torch.gather(nvec, 1, fnz.unsqueeze(1)).squeeze(1)
+            allz = (nvec == 0).all(dim=1)
+            hemi = (sign > 0) | allz
+            factors = torch.where(allz, torch.ones_like(k_sq), torch.full_like(k_sq, 2.0))
+            keep = sph & hemi
+            kgraph = kgraph[keep].to(torch.int32).contiguous()
+            kvec = kvec[keep].contiguous(); k_sq = k_sq[keep].contiguous()
+            factors = factors[keep].contiguous(); M = kvec.shape[0]
+            na = torch.bincount(batch, minlength=n_graphs)
+            atom_off = (torch.cumsum(na, 0)-na).to(torch.int32).contiguous()
+            na32 = na.to(torch.int32).contiguous()
+            nk = torch.bincount(kgraph.to(torch.long), minlength=n_graphs)
+            koff = (torch.cumsum(nk, 0)-nk).to(torch.int32).contiguous()
+            nk32 = nk.to(torch.int32).contiguous(); batch32 = batch.to(torch.int32).contiguous()
+            q = q.contiguous(); r = r.contiguous()
+            Sr, Si = _SFwd.apply(q, r, kvec, kgraph, atom_off, na32, batch32, koff, nk32)
+            S_sq = Sr**2 + Si**2
+            kfac = torch.exp(-self.sigma_sq_half*k_sq)/k_sq
+            w = (factors*kfac).unsqueeze(-1)
+            pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+            pot.index_add_(0, kgraph.to(torch.long), w*S_sq)
+            volume = torch.linalg.det(cell)
+            pot = pot/volume.unsqueeze(1)
+            if self.remove_self_interaction:
+                q_sq = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+                q_sq.index_add_(0, batch, q**2)
+                pot = pot - q_sq/(self.sigma*(2*torch.pi)**1.5)
+            return (pot*self.norm_factor).sum(dim=1)
 
 
 class BatchedEwald(nn.Module):
@@ -122,119 +432,6 @@ class BatchedEwald(nn.Module):
         return pot.sum(dim=1)                                        # [G]
 
 
-class HybridBatchedEwald(nn.Module):
-    """
-    Adaptive wrapper: keeps small/normal cells together as the bulk and 
-    recursively peels the largest into further groups
-    """
-
-    def __init__(
-        self,
-        dl: float = 2.0,
-        sigma: float = 1.0,
-        remove_self_interaction: bool = True,
-        norm_factor: float = 90.4756,
-        mem_budget: Optional[int] = None,
-        safety: float = 0.8,
-    ):
-        super().__init__()
-        self.dl = dl
-        self.mem_budget = mem_budget
-        self.safety = safety
-        self.core = BatchedEwald(dl, sigma, remove_self_interaction, norm_factor)
-
-    def _grid_Pprime(self, cell: torch.Tensor) -> int:
-        device, dtype = cell.device, cell.dtype
-        G = self.core.twopi * torch.linalg.inv(cell).transpose(1, 2)
-        Nk = torch.clamp((torch.norm(cell, dim=2) / self.dl).to(torch.int64), min=1)
-        Nm = Nk.max(0).values
-        ax = [torch.arange(-int(Nm[i]), int(Nm[i]) + 1, device=device) for i in range(3)]
-        nvec = torch.stack(torch.meshgrid(*ax, indexing='ij'), -1).reshape(-1, 3).to(dtype)
-        ksq = (torch.einsum('pd,gde->gpe', nvec, G) ** 2).sum(-1)
-        box = (nvec.abs().unsqueeze(0) <= Nk.unsqueeze(1)).all(2)
-        sph = (ksq > 0) & (ksq <= self.core.k_sq_max)
-        nz = (nvec != 0).to(torch.int64)
-        sign = torch.gather(nvec, 1, torch.argmax(nz, 1).unsqueeze(1)).squeeze(1)
-        hemi = (sign > 0) | (nvec == 0).all(1)
-        return int((box & sph & hemi.unsqueeze(0)).any(0).sum())
-
-    def _budget(self, device: torch.device) -> float:
-        if self.mem_budget is not None:
-            return float(self.mem_budget)
-        if device.type == 'cuda':
-            free, _ = torch.cuda.mem_get_info(device)
-            return self.safety * free
-        return float('inf')
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        r: torch.Tensor,
-        cell: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if q.dim() == 1:
-            q = q.unsqueeze(1)
-        N, n_q = r.shape[0], q.shape[1]
-        device, dtype = r.device, r.dtype
-        if batch is None:
-            batch = torch.zeros(N, dtype=torch.long, device=device)
-        n_graphs = cell.shape[0]
-
-        # gate: estimate peak from N * P' (no [N,P] tensor built)
-        Pp = self._grid_Pprime(cell)
-        planes = 6 + 2 * n_q
-        autograd = 2 if torch.is_grad_enabled() else 1
-        const = planes * r.element_size() * autograd
-        budget = self._budget(device)
-        if N * Pp * const <= budget:
-            return self.core(q=q, r=r, cell=cell, batch=batch)
-
-        # fallback: tier cells into budget-fitting groups by recursively
-        Nk = torch.clamp((torch.norm(cell, dim=2) / self.dl).to(torch.int64), min=1)
-        natoms = torch.bincount(batch, minlength=n_graphs)
-        dense = (2 * Nk + 1).prod(1)
-        ratio = Pp / float((2 * Nk.max(0).values + 1).prod())
-
-        def fits(mask: torch.Tensor) -> bool:
-            gi = mask.nonzero(as_tuple=True)[0]
-            p = float((2 * Nk[gi].max(0).values + 1).prod()) * ratio
-            return float(natoms[gi].sum()) * p * const <= budget
-
-        gid = torch.full((n_graphs,), -1, dtype=torch.long, device=device)
-        remaining = torch.ones(n_graphs, dtype=torch.bool, device=device)
-        g = 0
-        while remaining.any():
-            in_bulk = remaining.clone()
-            rem = remaining.nonzero(as_tuple=True)[0]
-            order = rem[torch.argsort(dense[rem], descending=True)].tolist()
-            oi = 0
-            while int(in_bulk.sum()) > 1 and not fits(in_bulk):
-                while oi < len(order) and not in_bulk[order[oi]]:
-                    oi += 1
-                if oi >= len(order):
-                    break
-                in_bulk[order[oi]] = False
-                oi += 1
-            gid[in_bulk] = g
-            remaining = remaining & ~in_bulk
-            g += 1
-        n_groups = g
-
-        atom_gid = gid[batch]
-        out_idx, out_e = [], []
-        for grp in range(n_groups):
-            graphs = (gid == grp).nonzero(as_tuple=True)[0]
-            amask = atom_gid == grp
-            remap = torch.full((n_graphs,), -1, dtype=torch.long, device=device)
-            remap[graphs] = torch.arange(graphs.shape[0], device=device)
-            e_sub = self.core(q[amask], r[amask], cell[graphs], remap[batch[amask]])
-            out_idx.append(graphs)
-            out_e.append(e_sub)
-        out = torch.zeros(n_graphs, device=device, dtype=dtype)
-        return out.index_copy(0, torch.cat(out_idx), torch.cat(out_e))
-
-
 class FlatBatchedEwald(nn.Module):
     """
     k-points are flattened for batch computation.
@@ -323,14 +520,16 @@ class FlatBatchedEwald(nn.Module):
             - torch.repeat_interleave(block_off, counts)
         a_idx = (base + local).to(torch.int32)                     # [P_tot]
 
-        # --- structure factor over contiguous k-blocks (no per-pair k index) ---
+        # --- structure factor via scatter-add ---
+        M = kvec_flat.shape[0]
+        k_idx = torch.repeat_interleave(torch.arange(M, device=device), counts)  # [P_tot]
         kvec_pair = torch.repeat_interleave(kvec_flat, counts, dim=0)  # [P_tot,3]
         phase = (r[a_idx] * kvec_pair).sum(-1)                     # [P_tot]
         qa = q[a_idx]                                              # [P_tot,n_q]
-        S_real = torch.segment_reduce(
-            qa * torch.cos(phase).unsqueeze(-1), 'sum', lengths=counts)  # [M,n_q]
-        S_imag = torch.segment_reduce(
-            qa * torch.sin(phase).unsqueeze(-1), 'sum', lengths=counts)
+        S_real = torch.zeros(M, n_q, device=device, dtype=dtype).index_add(
+            0, k_idx, qa * torch.cos(phase).unsqueeze(-1))         # [M,n_q]
+        S_imag = torch.zeros(M, n_q, device=device, dtype=dtype).index_add(
+            0, k_idx, qa * torch.sin(phase).unsqueeze(-1))
         S_sq = S_real ** 2 + S_imag ** 2                          # [M,n_q]
 
         # --- assemble per-graph potential (k_sq_flat > 0 guaranteed) ---
