@@ -15,6 +15,13 @@ IMPLEMENTED_CUTOFF_FUNCTION = ['poly_cut', 'XPLOR']
 IMPLEMENTED_SELF_CONNECTION_TYPE = ['nequip', 'linear']
 IMPLEMENTED_INTERACTION_TYPE = ['nequip']
 
+IMPLEMENTED_MODAL_MODULE_DICT = {
+    KEY.USE_MODAL_NODE_EMBEDDING: 'onehot_to_feature_x',
+    KEY.USE_MODAL_SELF_INTER_INTRO: 'self_interaction_1',
+    KEY.USE_MODAL_SELF_INTER_OUTRO: 'self_interaction_2',
+    KEY.USE_MODAL_OUTPUT_BLOCK: 'reduce_input_to_hidden',
+}
+
 IMPLEMENTED_SHIFT = ['per_atom_energy_mean', 'elemwise_reference_energies']
 IMPLEMENTED_SCALE = ['force_rms', 'per_atom_energy_std', 'elemwise_force_rms']
 
@@ -26,6 +33,8 @@ SUPPORTING_ERROR_TYPES = [
     'Stress',
     'Stress_GPa',
     'TotalLoss',
+    'L2_modal',
+    'Modal_cos',
 ]
 
 IMPLEMENTED_MODEL = ['E3_equivariant_model']
@@ -116,6 +125,8 @@ DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG = {
     KEY.CONV_DENOMINATOR: 'avg_num_neigh',
     KEY.TRAIN_DENOMINTAOR: False,
     KEY.TRAIN_SHIFT_SCALE: False,
+    KEY.TRAIN_SHIFT: False,
+    KEY.TRAIN_SCALE: False,
     # KEY.OPTIMIZE_BY_REDUCE: True,  # deprecated, always True
     KEY.USE_BIAS_IN_LINEAR: False,
     KEY.USE_MODAL_NODE_EMBEDDING: False,
@@ -161,6 +172,8 @@ MODEL_CONFIG_CONDITION = {
     ],
     KEY.CONVOLUTION_WEIGHT_NN_HIDDEN_NEURONS: list,
     KEY.TRAIN_SHIFT_SCALE: bool,
+    KEY.TRAIN_SHIFT: bool,
+    KEY.TRAIN_SCALE: bool,
     KEY.TRAIN_DENOMINTAOR: bool,
     KEY.USE_BIAS_IN_LINEAR: bool,
     KEY.USE_MODAL_NODE_EMBEDDING: bool,
@@ -217,6 +230,7 @@ DEFAULT_DATA_CONFIG = {
     KEY.USE_MODAL_WISE_SCALE: False,
     KEY.SHIFT: 'per_atom_energy_mean',
     KEY.SCALE: 'force_rms',
+    KEY.LOADER_KWARGS: {},
     # KEY.DATA_SHUFFLE: True,
     # KEY.DATA_WEIGHT: False,
     # KEY.DATA_MODALITY: False,
@@ -232,7 +246,7 @@ DATA_CONFIG_CONDITION = {
     KEY.RATIO: float,
     KEY.BATCH_SIZE: int,
     KEY.PREPROCESS_NUM_CORES: int,
-    KEY.DATASET_TYPE: lambda x: x in ['graph', 'atoms'],
+    KEY.DATASET_TYPE: lambda x: x in ['graph', 'atoms', 'custom', 'aselmdb'],
     # KEY.USE_SPECIES_WISE_SHIFT_SCALE: bool,
     KEY.SHIFT: lambda x: type(x) in [float, list] or x in IMPLEMENTED_SHIFT,
     KEY.SCALE: lambda x: type(x) in [float, list] or x in IMPLEMENTED_SCALE,
@@ -261,15 +275,20 @@ DEFAULT_TRAINING_CONFIG = {
     KEY.OPTIM_PARAM: {},
     KEY.SCHEDULER: 'exponentiallr',
     KEY.SCHEDULER_PARAM: {},
+    KEY.ENERGY_WEIGHT: 1.0,
     KEY.FORCE_WEIGHT: 0.1,
     KEY.STRESS_WEIGHT: 1e-6,  # SIMPLE-NN default
+    KEY.GRAD_CLIP: None,
+    KEY.REG_PARAM: {},
     KEY.PER_EPOCH: 5,
+    KEY.TRAIN_BY_BATCH: False,
     # KEY.USE_TESTSET: False,
     KEY.CONTINUE: {
         KEY.CHECKPOINT: False,
         KEY.RESET_OPTIMIZER: False,
         KEY.RESET_SCHEDULER: False,
         KEY.RESET_EPOCH: False,
+        KEY.RESET_DATA_PROGRESS: True,
         KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT: True,
         KEY.USE_STATISTIC_VALUES_FOR_CP_MODAL_ONLY: True,
     },
@@ -293,16 +312,21 @@ DEFAULT_TRAINING_CONFIG = {
 TRAINING_CONFIG_CONDITION = {
     KEY.RANDOM_SEED: int,
     KEY.EPOCH: int,
+    KEY.ENERGY_WEIGHT: float,
     KEY.FORCE_WEIGHT: float,
     KEY.STRESS_WEIGHT: float,
+    KEY.GRAD_CLIP: lambda x: x is None or (type(x) in [float, int] and x > 0),
+    KEY.REG_PARAM: dict,
     KEY.USE_TESTSET: None,  # Not used
     KEY.NUM_WORKERS: int,
-    KEY.PER_EPOCH: int,
+    KEY.PER_EPOCH: lambda x: type(x) in [float, int],
+    KEY.TRAIN_BY_BATCH: bool,
     KEY.CONTINUE: {
         KEY.CHECKPOINT: str,
         KEY.RESET_OPTIMIZER: bool,
         KEY.RESET_SCHEDULER: bool,
         KEY.RESET_EPOCH: bool,
+        KEY.RESET_DATA_PROGRESS: bool,
         KEY.USE_STATISTIC_VALUES_OF_CHECKPOINT: bool,
         KEY.USE_STATISTIC_VALUES_FOR_CP_MODAL_ONLY: bool,
     },

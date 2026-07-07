@@ -36,6 +36,7 @@ class SevenNetCalculator(Calculator):
         enable_flash: Optional[bool] = False,
         enable_oeq: Optional[bool] = False,
         compute_atomic_virial: bool = False,
+        ewald_type: Optional[str] = None,
         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
         **kwargs,
     ) -> None:
@@ -89,6 +90,9 @@ class SevenNetCalculator(Calculator):
         enable_flash = os.getenv('SEVENNET_ENABLE_FLASH') == '1' or enable_flash
         enable_oeq = os.getenv('SEVENNET_ENABLE_OEQ') == '1' or enable_oeq
 
+        if not (enable_cueq or enable_flash or enable_oeq):
+            util.warn_no_tp_accelerator('SevenNetCalculator')
+
         if enable_cueq and file_type == 'model_instance':
             warnings.warn(
                 'file_type should be checkpoint to enable cueq. cueq set to False'
@@ -113,6 +117,10 @@ class SevenNetCalculator(Calculator):
 
         if file_type == 'checkpoint' and isinstance(model, str):
             cp = util.load_checkpoint(model)
+
+            if ewald_type is not None:
+                _ = cp.config  # trigger lazy load of cp._config
+                cp._config.setdefault(KEY.LES_CONFIG, {})['ewald_type'] = ewald_type
 
             model_loaded = cp.build_model(
                 enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq  # noqa: E501
@@ -142,6 +150,7 @@ class SevenNetCalculator(Calculator):
             self.sevennet_config = sevennet_config
 
         self.model = model_loaded
+        self._with_shift = 'edge_preprocess' in self.model._modules
         if self.compute_atomic_virial:
             force_output = self.model._modules.get('force_output')
             if force_output is None or not hasattr(
@@ -219,7 +228,7 @@ class SevenNetCalculator(Calculator):
         if atoms is None:
             raise ValueError('No atoms to evaluate')
         data = AtomGraphData.from_numpy_dict(
-            unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
+            unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=self._with_shift)
         )
         if self.modal:
             data[KEY.DATA_MODALITY] = self.modal
