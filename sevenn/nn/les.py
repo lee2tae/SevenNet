@@ -354,3 +354,122 @@ class NeutralizeCharge(nn.Module):
 
         data[self.data_key_q] = q
         return data
+
+
+class BornEffectiveCharge(nn.Module):
+    """
+    Native Born effective charge (BEC) readout.
+    """
+
+    def __init__(
+        self,
+        data_key_q: str = KEY.LES_Q,
+        data_key_pos: str = KEY.POS,
+        data_key_cell: str = KEY.CELL,
+        data_key_out: str = KEY.LES_BEC,
+        remove_mean: bool = True,
+        epsilon_factor: float = 1.0,
+        output_index: Optional[int] = None,
+    ):
+        super().__init__()
+        self.data_key_q = data_key_q
+        self.data_key_pos = data_key_pos
+        self.data_key_cell = data_key_cell
+        self.data_key_out = data_key_out
+        self.remove_mean = remove_mean
+        self.epsilon_factor = epsilon_factor
+        self.normalization_factor = epsilon_factor ** 0.5
+        self.output_index = output_index
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+
+    def _grad_real(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        # d y / d x
+        create = self.training
+        if y.dim() == 1:
+            g = torch.autograd.grad(
+                [y], [x],
+                grad_outputs=[torch.ones_like(y)],
+                retain_graph=True,
+                create_graph=create,
+                allow_unused=True,
+            )[0]
+            return g if g is not None else torch.zeros_like(x)
+        cols = []
+        for i in range(y.shape[1]):
+            g = torch.autograd.grad(
+                [y[:, i]], [x],
+                grad_outputs=[torch.ones_like(y[:, i])],
+                retain_graph=True,
+                create_graph=create,
+                allow_unused=True,
+            )[0]
+            cols.append(g if g is not None else torch.zeros_like(x))
+        return torch.stack(cols, dim=2)
+
+    def _grad(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        # Complex y: split into real/imag parts (autograd is real-valued).
+        if y.is_complex():
+            return self._grad_real(y.real, x) + 1j * self._grad_real(y.imag, x)
+        return self._grad_real(y, x)
+
+    def _pol_pbc(self, r_now, q_now, box):
+        # Berry-phase-style polarization for a periodic cell.
+        r_frac = torch.matmul(r_now, torch.linalg.inv(box))
+        phase = torch.exp(1j * 2.0 * torch.pi * r_frac)          # (n, 3)
+        S = torch.sum(q_now * phase, dim=0)                      # (3,)
+        pol = torch.matmul(box.to(S.dtype), S.unsqueeze(1)) / (1j * 2.0 * torch.pi)
+        return pol.reshape(-1), phase
+
+    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+        q = data[self.data_key_q]
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        q = q.sum(dim=1, keepdim=True)   # (N, 1) effective charge
+        r = data[self.data_key_pos]      # (N, 3), strained, requires_grad
+
+        if self._is_batch_data:
+            batch = data[KEY.BATCH].long()
+            n_graphs = int(batch.max().item()) + 1
+        else:
+            batch = torch.zeros(r.shape[0], dtype=torch.long, device=r.device)
+            n_graphs = 1
+
+        if self.data_key_cell in data:
+            cell = data[self.data_key_cell].view(-1, 3, 3)
+        else:
+            cell = torch.zeros((n_graphs, 3, 3), device=r.device, dtype=r.dtype)
+
+        all_P = []
+
+        cdtype = torch.complex128 if r.dtype == torch.float64 else torch.complex64
+        phase_shape = (r.shape[0],) if self.output_index is not None else r.shape
+        phases = torch.zeros(phase_shape, dtype=cdtype, device=r.device)
+        for i in range(n_graphs):
+            mask = batch == i
+            r_now, q_now = r[mask], q[mask]
+            if self.remove_mean:
+                q_now = q_now - q_now.mean(dim=0, keepdim=True)
+            box = cell[i]
+            if torch.linalg.det(box).abs() < 1e-6:
+                pol = torch.sum(q_now * r_now, dim=0)            # (3,)
+                phase = torch.ones_like(r_now, dtype=cdtype)
+            else:
+                pol, phase = self._pol_pbc(r_now, q_now, box)
+            if self.output_index is not None:
+                pol = pol[self.output_index]
+                phase = phase[:, self.output_index]
+            all_P.append(pol * self.normalization_factor)
+            phases[mask] = phase.to(cdtype)
+
+        P = torch.stack(all_P, dim=0)          # (n_graphs, 3) or (n_graphs,)
+
+        if self.output_index is None:
+            # grad -> (N, b, a); transpose so index1=P-component a, index2=r-component b
+            bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
+            result = bec * phases.unsqueeze(2).conj()             # dephase over a
+        else:
+            bec = self._grad(P, r)                                # (N, 3)
+            result = bec * phases.unsqueeze(1).conj()
+
+        data[self.data_key_out] = result.real
+        return data

@@ -37,6 +37,7 @@ class SevenNetCalculator(Calculator):
         enable_oeq: Optional[bool] = False,
         compute_atomic_virial: bool = False,
         ewald_type: Optional[str] = None,
+        compute_bec: bool = False,
         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
         **kwargs,
     ) -> None:
@@ -68,10 +69,18 @@ class SevenNetCalculator(Calculator):
             Not used, but can be used to carry meta information of this calculator
         compute_atomic_virial: bool, default=False
             If True, request per-atom virial output (`stresses`) at runtime.
+        ewald_type: str | None, default=None
+            Override the LES Ewald backend of a checkpoint at load time.
+        compute_bec: bool, default=False
+            If True, compute Born effective charges for an LES checkpoint and
+            expose them in ``calc.results['bec']`` as an (N, 3, 3) array. The
+            BEC module is parameter-free, so this works on any LES checkpoint
+            without retraining. Requires file_type='checkpoint'.
         """
         super().__init__(**kwargs)
         self.sevennet_config = None
         self.compute_atomic_virial = compute_atomic_virial
+        self.compute_bec = compute_bec
 
         if isinstance(model, pathlib.PurePath):
             model = str(model)
@@ -122,6 +131,16 @@ class SevenNetCalculator(Calculator):
                 _ = cp.config  # trigger lazy load of cp._config
                 cp._config.setdefault(KEY.LES_CONFIG, {})['ewald_type'] = ewald_type
 
+            if compute_bec:
+                _ = cp.config  # trigger lazy load of cp._config
+                if not cp._config.get(KEY.USE_LES, False):
+                    raise ValueError(
+                        'compute_bec=True requires an LES checkpoint '
+                        '(use_les=True). This model has no latent charges.'
+                    )
+                # Note: BEC is parameter-free
+                cp._config.setdefault(KEY.LES_CONFIG, {})['compute_bec'] = True
+
             model_loaded = cp.build_model(
                 enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq  # noqa: E501
             )
@@ -151,6 +170,12 @@ class SevenNetCalculator(Calculator):
 
         self.model = model_loaded
         self._with_shift = 'edge_preprocess' in self.model._modules
+        if self.compute_bec and 'les_bec' not in self.model._modules:
+            raise ValueError(
+                'compute_bec=True but the loaded model has no BEC module. '
+                'Enable it via a checkpoint (file_type="checkpoint"), or build '
+                'the model instance with les_config.compute_bec=True.'
+            )
         if self.compute_atomic_virial:
             force_output = self.model._modules.get('force_output')
             if force_output is None or not hasattr(
@@ -220,6 +245,10 @@ class SevenNetCalculator(Calculator):
                 output[KEY.PRED_ATOMIC_VIRIAL].detach().cpu().numpy()[:num_atoms, :]
             )
             results['stresses'] = virial
+        if KEY.LES_BEC in output:
+            results['bec'] = (
+                output[KEY.LES_BEC].detach().cpu().numpy()[:num_atoms]
+            )
         return results
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):

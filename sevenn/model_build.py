@@ -31,6 +31,7 @@ from .nn.self_connection import (
 )
 from .nn.les import (
     AddLREnergy,
+    BornEffectiveCharge,
     LatentChargeReadout,
     LatentEwaldSum,
     NeutralizeCharge,
@@ -673,8 +674,6 @@ def build_E3_equivariant_model(
                     les_args=les_cfg.get('les_args', {'use_atomwise': False}),
                     data_key_in=KEY.LES_Q,
                     data_key_out=KEY.LR_ENERGY,
-                    compute_bec=les_cfg.get('compute_bec', False),
-                    bec_output_index=les_cfg.get('bec_output_index', None),
                     ewald_type=les_cfg.get('ewald_type', 'batched'),
                 ),
                 # Total = SR + LR
@@ -694,6 +693,16 @@ def build_E3_equivariant_model(
                     data_key_out=KEY.PRED_TOTAL_ENERGY,
                 ),
             }
+        )
+
+    if config.get(KEY.USE_LES, False) and les_cfg.get('compute_bec', False):
+        les_bec_args = les_cfg.get('les_args', {})
+        layers['les_bec'] = BornEffectiveCharge(
+            data_key_q=KEY.LES_Q,
+            data_key_out=KEY.LES_BEC,
+            remove_mean=les_bec_args.get('remove_mean', True),
+            epsilon_factor=les_bec_args.get('epsilon_factor', 1.0),
+            output_index=les_cfg.get('bec_output_index', None),
         )
 
     if config.get(KEY.USE_LES, False):
