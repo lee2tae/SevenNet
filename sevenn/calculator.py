@@ -38,6 +38,8 @@ class SevenNetCalculator(Calculator):
         compute_atomic_virial: bool = False,
         ewald_type: Optional[str] = None,
         compute_bec: bool = False,
+        compute_dipole: bool = False,
+        epsilon_factor: Optional[float] = None,
         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
         **kwargs,
     ) -> None:
@@ -76,11 +78,21 @@ class SevenNetCalculator(Calculator):
             expose them in ``calc.results['bec']`` as an (N, 3, 3) array. The
             BEC module is parameter-free, so this works on any LES checkpoint
             without retraining. Requires file_type='checkpoint'.
+        compute_dipole: bool, default=False
+            If True, expose the dipole moment in ``calc.results['dipole']``
+            as a (3,) array. Requires file_type='checkpoint'.
+        epsilon_factor: float | None, default=None
+            High-frequency dielectric constant ε∞. The polarization (and hence
+            BEC/dipole) is scaled by √ε∞ to recover physical charges from the
+            LES charges (q_i = √ε∞ q_i^LES). If None, use the checkpoint's stored
+            value (default 1.0 = raw LES charges). Requires file_type='checkpoint'.
         """
         super().__init__(**kwargs)
         self.sevennet_config = None
         self.compute_atomic_virial = compute_atomic_virial
         self.compute_bec = compute_bec
+        self.compute_dipole = compute_dipole
+        self.epsilon_factor = epsilon_factor
 
         if isinstance(model, pathlib.PurePath):
             model = str(model)
@@ -141,6 +153,24 @@ class SevenNetCalculator(Calculator):
                 # Note: BEC is parameter-free
                 cp._config.setdefault(KEY.LES_CONFIG, {})['compute_bec'] = True
 
+            if compute_dipole:
+                _ = cp.config  # trigger lazy load of cp._config
+                if not cp._config.get(KEY.USE_LES, False):
+                    raise ValueError(
+                        'compute_dipole=True requires an LES checkpoint '
+                        '(use_les=True). This model has no latent charges.'
+                    )
+                cp._config.setdefault(KEY.LES_CONFIG, {})['compute_dipole'] = True
+
+            if epsilon_factor is not None:
+                _ = cp.config  # trigger lazy load of cp._config
+                if not cp._config.get(KEY.USE_LES, False):
+                    raise ValueError(
+                        'epsilon_factor requires an LES checkpoint (use_les=True).'
+                    )
+                les_cfg = cp._config.setdefault(KEY.LES_CONFIG, {})
+                les_cfg.setdefault('les_args', {})['epsilon_factor'] = epsilon_factor
+
             model_loaded = cp.build_model(
                 enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq  # noqa: E501
             )
@@ -176,6 +206,12 @@ class SevenNetCalculator(Calculator):
                 'Enable it via a checkpoint (file_type="checkpoint"), or build '
                 'the model instance with les_config.compute_bec=True.'
             )
+        if self.compute_dipole and 'les_bec' not in self.model._modules:
+            raise ValueError(
+                'compute_dipole=True but the loaded model has no dipole module. '
+                'Enable it via a checkpoint (file_type="checkpoint"), or build '
+                'the model instance with les_config.compute_dipole=True.'
+            )
         if self.compute_atomic_virial:
             force_output = self.model._modules.get('force_output')
             if force_output is None or not hasattr(
@@ -210,6 +246,8 @@ class SevenNetCalculator(Calculator):
             'stresses',
             'energies',
         ]
+        if self.compute_dipole:
+            self.implemented_properties.append('dipole')
 
     def set_atoms(self, atoms: Atoms) -> None:
         # called by ase, when atoms.calc = calc
@@ -248,6 +286,10 @@ class SevenNetCalculator(Calculator):
         if KEY.LES_BEC in output:
             results['bec'] = (
                 output[KEY.LES_BEC].detach().cpu().numpy()[:num_atoms]
+            )
+        if KEY.LES_DIPOLE in output:
+            results['dipole'] = (
+                output[KEY.LES_DIPOLE].detach().cpu().numpy().reshape(-1)[:3]
             )
         return results
 

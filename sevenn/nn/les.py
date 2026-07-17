@@ -358,7 +358,7 @@ class NeutralizeCharge(nn.Module):
 
 class BornEffectiveCharge(nn.Module):
     """
-    Native Born effective charge (BEC) readout.
+    Native Born effective charge (BEC) and dipole readout.
     """
 
     def __init__(
@@ -367,19 +367,25 @@ class BornEffectiveCharge(nn.Module):
         data_key_pos: str = KEY.POS,
         data_key_cell: str = KEY.CELL,
         data_key_out: str = KEY.LES_BEC,
+        data_key_dipole: str = KEY.LES_DIPOLE,
         remove_mean: bool = True,
         epsilon_factor: float = 1.0,
         output_index: Optional[int] = None,
+        compute_bec: bool = False,
+        compute_dipole: bool = False,
     ):
         super().__init__()
         self.data_key_q = data_key_q
         self.data_key_pos = data_key_pos
         self.data_key_cell = data_key_cell
         self.data_key_out = data_key_out
+        self.data_key_dipole = data_key_dipole
         self.remove_mean = remove_mean
         self.epsilon_factor = epsilon_factor
         self.normalization_factor = epsilon_factor ** 0.5
         self.output_index = output_index
+        self.compute_bec = compute_bec
+        self.compute_dipole = compute_dipole
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
 
     def _grad_real(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -463,13 +469,20 @@ class BornEffectiveCharge(nn.Module):
 
         P = torch.stack(all_P, dim=0)          # (n_graphs, 3) or (n_graphs,)
 
-        if self.output_index is None:
-            # grad -> (N, b, a); transpose so index1=P-component a, index2=r-component b
-            bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
-            result = bec * phases.unsqueeze(2).conj()             # dephase over a
-        else:
-            bec = self._grad(P, r)                                # (N, 3)
-            result = bec * phases.unsqueeze(1).conj()
+        if self.compute_dipole:
+            dip = P.real
+            data[self.data_key_dipole] = (
+                dip if self._is_batch_data else dip.squeeze(0)
+            )
 
-        data[self.data_key_out] = result.real
+        if self.compute_bec:
+            if self.output_index is None:
+                # grad -> (N, b, a); transpose so index1=P-comp a, index2=r-comp b
+                bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
+                result = bec * phases.unsqueeze(2).conj()             # dephase over a
+            else:
+                bec = self._grad(P, r)                                # (N, 3)
+                result = bec * phases.unsqueeze(1).conj()
+            data[self.data_key_out] = result.real
+
         return data

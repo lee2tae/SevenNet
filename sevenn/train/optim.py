@@ -17,11 +17,11 @@ class L2MAE(nn.Module):
     ):
         super().__init__()
         self.prop = prop
-        self.dim = 3 if prop == 'force' else 6
+        self.dim = 3 if prop == 'force' else 9 if prop == 'bec' else 6
         self.reduction = reduction
 
     def forward(self, input, target):
-        if self.prop == 'force':
+        if self.prop in ('force', 'bec'):
             diff = input.view([-1, self.dim]) - target.view([-1, self.dim])
         else:
             diff = input.view([-1, self.dim]) - target.view([-1, self.dim])

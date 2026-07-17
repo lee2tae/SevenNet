@@ -64,6 +64,8 @@ LES_F: Final[str] = 'les_fukui_factor'             # (N_atoms, 1) Fukui-style re
 SR_ENERGY: Final[str] = 'les_sr_energy'            # (n_graphs,) short-range energy sum
 LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewald energy
 LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges
+LES_DIPOLE: Final[str] = 'les_dipole'              # (n_graphs, 3) dipole moment / polarization
+LES_BEC_REF: Final[str] = 'les_bec_ref'            # (N_atoms, 3, 3) reference DFT Born charges
 
 PRED_PER_ATOM_ENERGY: Final[str] = 'inferred_per_atom_energy'
 PER_ATOM_ENERGY: Final[str] = 'per_atom_energy'
@@ -130,6 +132,7 @@ SCHEDULER_BATCH_MODE = 'scheduler_batch_mode'
 ENERGY_WEIGHT = 'energy_loss_weight'
 FORCE_WEIGHT = 'force_loss_weight'
 STRESS_WEIGHT = 'stress_loss_weight'
+BEC_WEIGHT = 'bec_loss_weight'
 GRAD_CLIP = 'grad_clip'
 DEVICE = 'device'
 DTYPE = 'dtype'
@@ -137,6 +140,7 @@ DTYPE = 'dtype'
 TRAIN_SHUFFLE = 'train_shuffle'
 
 IS_TRAIN_STRESS = 'is_train_stress'
+IS_TRAIN_BEC = 'is_train_bec'
 
 CONTINUE = 'continue'
 CHECKPOINT = 'checkpoint'

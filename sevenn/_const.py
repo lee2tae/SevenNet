@@ -32,6 +32,7 @@ SUPPORTING_ERROR_TYPES = [
     'Force',
     'Stress',
     'Stress_GPa',
+    'BEC',
     'TotalLoss',
     'L2_modal',
     'Modal_cos',
@@ -278,6 +279,7 @@ DEFAULT_TRAINING_CONFIG = {
     KEY.ENERGY_WEIGHT: 1.0,
     KEY.FORCE_WEIGHT: 0.1,
     KEY.STRESS_WEIGHT: 1e-6,  # SIMPLE-NN default
+    KEY.BEC_WEIGHT: 1.0,
     KEY.GRAD_CLIP: None,
     KEY.REG_PARAM: {},
     KEY.PER_EPOCH: 5,
@@ -296,6 +298,7 @@ DEFAULT_TRAINING_CONFIG = {
     KEY.CSV_LOG: 'log.csv',
     KEY.NUM_WORKERS: 0,
     KEY.IS_TRAIN_STRESS: True,
+    KEY.IS_TRAIN_BEC: False,
     KEY.TRAIN_SHUFFLE: True,
     KEY.ERROR_RECORD: [
         ['Energy', 'RMSE'],
@@ -315,6 +318,7 @@ TRAINING_CONFIG_CONDITION = {
     KEY.ENERGY_WEIGHT: float,
     KEY.FORCE_WEIGHT: float,
     KEY.STRESS_WEIGHT: float,
+    KEY.BEC_WEIGHT: float,
     KEY.GRAD_CLIP: lambda x: x is None or (type(x) in [float, int] and x > 0),
     KEY.REG_PARAM: dict,
     KEY.USE_TESTSET: None,  # Not used
@@ -332,6 +336,7 @@ TRAINING_CONFIG_CONDITION = {
     },
     KEY.DEFAULT_MODAL: str,
     KEY.IS_TRAIN_STRESS: bool,
+    KEY.IS_TRAIN_BEC: bool,
     KEY.TRAIN_SHUFFLE: bool,
     KEY.ERROR_RECORD: error_record_condition,
     KEY.BEST_METRIC: str,

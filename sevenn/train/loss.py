@@ -202,6 +202,49 @@ class StressLoss(LossDefinition):
         return pred, ref, w_tensor
 
 
+class BecLoss(LossDefinition):
+    """
+    Loss for Born effective charges: per-atom 3x3 model tensor (KEY.LES_BEC)
+    vs the (N,9) DFT reference (KEY.LES_BEC_REF). Frames without a reference
+    carry NaN and are dropped by ignore_unlabeled. The base _preprocess
+    flattens both to (-1,), which aligns component-wise (row-major 3x3 == 9).
+    """
+
+    def __init__(
+        self,
+        name: str = 'BEC',
+        unit: str = 'e',
+        criterion: Optional[Callable] = None,
+        ref_key: str = KEY.LES_BEC_REF,
+        pred_key: str = KEY.LES_BEC,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            name=name,
+            unit=unit,
+            criterion=criterion,
+            ref_key=ref_key,
+            pred_key=pred_key,
+            **kwargs,
+        )
+
+    def _preprocess(
+        self, batch_data: Dict[str, Any], model: Optional[Callable] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        assert isinstance(self.pred_key, str) and isinstance(self.ref_key, str)
+        pred = torch.reshape(batch_data[self.pred_key], (-1,))
+        ref = torch.reshape(batch_data[self.ref_key], (-1,))
+        w_tensor = None
+
+        if self.use_weight:
+            loss_type = self.name.lower()
+            weight = batch_data[KEY.DATA_WEIGHT][loss_type]
+            w_tensor = weight[batch_data[KEY.BATCH]]
+            w_tensor = torch.repeat_interleave(w_tensor, 9)
+
+        return pred, ref, w_tensor
+
+
 class L2Regularization(LossDefinition):
     """
     L2 regularization for task-specific (modal) parameters.
@@ -319,11 +362,13 @@ def get_loss_functions_from_config(
         'energy': PerAtomEnergyLoss,
         'force': ForceLoss,
         'stress': StressLoss,
+        'bec': BecLoss,
     }
     loss_weights = {
         'energy': config.get(KEY.ENERGY_WEIGHT, 1.0),
         'force': config[KEY.FORCE_WEIGHT],
         'stress': config[KEY.STRESS_WEIGHT],
+        'bec': config.get(KEY.BEC_WEIGHT, 0.0),
     }
 
     use_weight = config.get(KEY.USE_WEIGHT, False)
@@ -332,6 +377,8 @@ def get_loss_functions_from_config(
     keys = ['energy', 'force']
     if config[KEY.IS_TRAIN_STRESS]:
         keys += ['stress']
+    if config.get(KEY.IS_TRAIN_BEC, False):
+        keys += ['bec']
 
     for key in keys:
         loss_info = loss_info_dict.get(key, {})

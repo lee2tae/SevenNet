@@ -210,6 +210,11 @@ def atoms_to_graph(
         data[KEY.CELL_SHIFT] = shift
         data[KEY.CELL] = cell
 
+    if 'bec_dft' in atoms.arrays:
+        data[KEY.LES_BEC_REF] = atoms.arrays['bec_dft'].reshape(
+            len(atomic_numbers), 3, 3
+        )
+
     if transfer_info and atoms.info is not None:
         info = copy.deepcopy(atoms.info)
         # save only metadata

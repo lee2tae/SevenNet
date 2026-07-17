@@ -695,14 +695,24 @@ def build_E3_equivariant_model(
             }
         )
 
-    if config.get(KEY.USE_LES, False) and les_cfg.get('compute_bec', False):
+    if config.get(KEY.USE_LES, False) and (
+        les_cfg.get('compute_bec', False)
+        or les_cfg.get('compute_dipole', False)
+        or config.get(KEY.IS_TRAIN_BEC, False)
+    ):
         les_bec_args = les_cfg.get('les_args', {})
         layers['les_bec'] = BornEffectiveCharge(
             data_key_q=KEY.LES_Q,
             data_key_out=KEY.LES_BEC,
+            data_key_dipole=KEY.LES_DIPOLE,
             remove_mean=les_bec_args.get('remove_mean', True),
             epsilon_factor=les_bec_args.get('epsilon_factor', 1.0),
             output_index=les_cfg.get('bec_output_index', None),
+            compute_bec=(
+                les_cfg.get('compute_bec', False)
+                or config.get(KEY.IS_TRAIN_BEC, False)
+            ),
+            compute_dipole=les_cfg.get('compute_dipole', False),
         )
 
     if config.get(KEY.USE_LES, False):

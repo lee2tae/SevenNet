@@ -60,6 +60,13 @@ _ERROR_TYPES = {
         'coeff': 160.21766208,
         'vdim': 6,
     },
+    'BEC': {
+        'name': 'BEC',
+        'ref_key': KEY.LES_BEC_REF,
+        'pred_key': KEY.LES_BEC,
+        'unit': 'e',
+        'vdim': 9,
+    },
     'L2_modal': {
         'name': 'L2_modal',
         'ref_key': None,
@@ -449,7 +456,10 @@ class ErrorRecorder:
                 stress_metric = CustomError(criteria, **get_err_type('Stress'))
                 metrics.append((stress_metric, config[KEY.STRESS_WEIGHT]))
         else:  # TODO: this is hard-coded
-            for efs in ['Energy', 'Force', 'Stress']:
+            efs_list = ['Energy', 'Force', 'Stress']
+            if config.get(KEY.IS_TRAIN_BEC, False):
+                efs_list.append('BEC')
+            for efs in efs_list:
                 if efs == 'Stress' and not is_stress:
                     continue
                 lf, w = _get_loss_function_from_name(loss_functions, efs)
