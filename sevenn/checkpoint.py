@@ -420,6 +420,10 @@ class SevenNetCheckpoint:
                                              default ``False``
                   bec_output_index (int)   — 0/1/2 for BEC component,
                                              default ``None``
+                  epsilon_mode (str)       — 'fixed' | 'learned' BEC epsilon
+                                             factor, default ``'fixed'``
+                  epsilon_hidden_channels  — hidden widths for the epsilon
+                                             head MLP, default ``None``
             freeze_sr: if ``True`` (default), set ``requires_grad=False`` on
                 all parameters whose top-level module is not
                 ``les_charge_readout`` or ``les_lr_energy``.  The Trainer
@@ -484,6 +488,7 @@ class SevenNetCheckpoint:
         # Any other missing key means an unexpected model mismatch.
         les_prefixes = (
             'les_charge_readout.', 'les_lr_energy.', 'les_fukui_readout.',
+            'les_epsilon_readout.', 'les_epsilon_pool.',
         )
         unexpected_missing = [
             k for k in missing if not k.startswith(les_prefixes)
@@ -507,7 +512,8 @@ class SevenNetCheckpoint:
 
         if freeze_sr:
             les_module_names = {
-                'les_charge_readout', 'les_lr_energy', 'les_fukui_readout'
+                'les_charge_readout', 'les_lr_energy', 'les_fukui_readout',
+                'les_epsilon_readout', 'les_epsilon_pool',
             }
             for name, param in model.named_parameters():
                 if name.split('.')[0] not in les_module_names:

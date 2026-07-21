@@ -32,6 +32,7 @@ from .nn.self_connection import (
 from .nn.les import (
     AddLREnergy,
     BornEffectiveCharge,
+    EpsilonFactorReadout,
     LatentChargeReadout,
     LatentEwaldSum,
     NeutralizeCharge,
@@ -658,6 +659,28 @@ def build_E3_equivariant_model(
         if _neutral != 'none':
             layers['les_neutralize'] = NeutralizeCharge(mode=_neutral)
 
+        _bec_needed = (
+            les_cfg.get('compute_bec', False)
+            or les_cfg.get('compute_dipole', False)
+            or config.get(KEY.IS_TRAIN_BEC, False)
+        )
+        _epsilon_mode = les_cfg.get('epsilon_mode', 'fixed')
+        if _epsilon_mode not in ('fixed', 'learned'):
+            raise ValueError(
+                f"Unknown epsilon_mode: {_epsilon_mode!r}. "
+                "Choose from 'fixed' | 'learned'."
+            )
+        # Epsilon head also reads full node features, so it sits here too.
+        if _bec_needed and _epsilon_mode == 'learned':
+            layers['les_epsilon_readout'] = LatentChargeReadout(
+                irreps_in=irreps_x,  # type: ignore
+                data_key_in=KEY.NODE_FEATURE,
+                data_key_out=KEY.LES_EPS_ATOMIC,
+                n_charges=1,
+                hidden_channels=les_cfg.get('epsilon_hidden_channels', None),
+            )
+            layers['les_epsilon_pool'] = EpsilonFactorReadout()
+
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
     if config.get(KEY.USE_LES, False):
@@ -695,11 +718,7 @@ def build_E3_equivariant_model(
             }
         )
 
-    if config.get(KEY.USE_LES, False) and (
-        les_cfg.get('compute_bec', False)
-        or les_cfg.get('compute_dipole', False)
-        or config.get(KEY.IS_TRAIN_BEC, False)
-    ):
+    if config.get(KEY.USE_LES, False) and _bec_needed:
         les_bec_args = les_cfg.get('les_args', {})
         layers['les_bec'] = BornEffectiveCharge(
             data_key_q=KEY.LES_Q,
@@ -707,6 +726,7 @@ def build_E3_equivariant_model(
             data_key_dipole=KEY.LES_DIPOLE,
             remove_mean=les_bec_args.get('remove_mean', True),
             epsilon_factor=les_bec_args.get('epsilon_factor', 1.0),
+            epsilon_mode=_epsilon_mode,
             output_index=les_cfg.get('bec_output_index', None),
             compute_bec=(
                 les_cfg.get('compute_bec', False)

@@ -85,7 +85,10 @@ class SevenNetCalculator(Calculator):
             High-frequency dielectric constant ε∞. The polarization (and hence
             BEC/dipole) is scaled by √ε∞ to recover physical charges from the
             LES charges (q_i = √ε∞ q_i^LES). If None, use the checkpoint's stored
-            value (default 1.0 = raw LES charges). Requires file_type='checkpoint'.
+            value (default 1.0 = raw LES charges); checkpoints trained with
+            epsilon_mode='learned' predict it per system instead (exposed as
+            ``calc.results['epsilon_factor']``). Passing a value forces
+            epsilon_mode='fixed'. Requires file_type='checkpoint'.
         """
         super().__init__(**kwargs)
         self.sevennet_config = None
@@ -175,6 +178,14 @@ class SevenNetCalculator(Calculator):
                 enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq  # noqa: E501
             )
             model_loaded.set_is_batch_data(False)
+
+            # Post-build so a learned-epsilon checkpoint still loads its
+            # state_dict (epsilon head modules must exist at load time).
+            if epsilon_factor is not None and 'les_bec' in model_loaded._modules:
+                bec_module = model_loaded._modules['les_bec']
+                bec_module.epsilon_mode = 'fixed'
+                bec_module.epsilon_factor = epsilon_factor
+                bec_module.normalization_factor = epsilon_factor ** 0.5
 
             self.type_map = cp.config[KEY.TYPE_MAP]
             self.cutoff = cp.config[KEY.CUTOFF]
@@ -290,6 +301,10 @@ class SevenNetCalculator(Calculator):
         if KEY.LES_DIPOLE in output:
             results['dipole'] = (
                 output[KEY.LES_DIPOLE].detach().cpu().numpy().reshape(-1)[:3]
+            )
+        if KEY.LES_EPS in output and self.epsilon_factor is None:
+            results['epsilon_factor'] = float(
+                output[KEY.LES_EPS].detach().cpu().reshape(-1)[0]
             )
         return results
 

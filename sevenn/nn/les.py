@@ -356,9 +356,56 @@ class NeutralizeCharge(nn.Module):
         return data
 
 
+class EpsilonFactorReadout(nn.Module):
+    """
+    Per-graph epsilon factor from per-atom raw values (KEY.LES_EPS_ATOMIC):
+        eps_g = softplus(mean_i(x_i) + c0)
+    c0 = softplus^-1(1) so eps_g = 1 at zero-initialised input, matching the
+    fixed epsilon_factor=1.0 default. Supervised only through the BEC loss;
+    E/F/s gradients never reach it.
+    """
+
+    _SOFTPLUS_INV_ONE = 0.5413248546129181
+
+    def __init__(
+        self,
+        data_key_in: str = KEY.LES_EPS_ATOMIC,
+        data_key_out: str = KEY.LES_EPS,
+    ):
+        super().__init__()
+        self.key_input = data_key_in
+        self.key_output = data_key_out
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+
+    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+        x = data[self.key_input].reshape(-1)   # (N_atoms,)
+        if self._is_batch_data:
+            batch = data[KEY.BATCH].long()
+            n_graphs = int(batch.max().item()) + 1
+        else:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            n_graphs = 1
+
+        sum_x = torch.zeros(n_graphs, device=x.device, dtype=x.dtype)
+        sum_x.scatter_add_(0, batch, x)
+        count = torch.zeros(n_graphs, device=x.device, dtype=x.dtype)
+        count.scatter_add_(0, batch, torch.ones_like(x))
+        mean_x = sum_x / count.clamp(min=1.0)
+
+        data[self.key_output] = torch.nn.functional.softplus(
+            mean_x + self._SOFTPLUS_INV_ONE
+        )
+        return data
+
+
 class BornEffectiveCharge(nn.Module):
     """
     Native Born effective charge (BEC) and dipole readout.
+
+    epsilon_mode:
+        'fixed'   → P is scaled by sqrt(epsilon_factor) (build-time constant).
+        'learned' → P is scaled by sqrt(data[KEY.LES_EPS]) per graph, predicted
+                    by EpsilonFactorReadout upstream.
     """
 
     def __init__(
@@ -368,21 +415,30 @@ class BornEffectiveCharge(nn.Module):
         data_key_cell: str = KEY.CELL,
         data_key_out: str = KEY.LES_BEC,
         data_key_dipole: str = KEY.LES_DIPOLE,
+        data_key_epsilon: str = KEY.LES_EPS,
         remove_mean: bool = True,
         epsilon_factor: float = 1.0,
+        epsilon_mode: str = 'fixed',
         output_index: Optional[int] = None,
         compute_bec: bool = False,
         compute_dipole: bool = False,
     ):
         super().__init__()
+        if epsilon_mode not in ('fixed', 'learned'):
+            raise ValueError(
+                f"Unknown epsilon_mode: {epsilon_mode!r}. "
+                "Choose from 'fixed' | 'learned'."
+            )
         self.data_key_q = data_key_q
         self.data_key_pos = data_key_pos
         self.data_key_cell = data_key_cell
         self.data_key_out = data_key_out
         self.data_key_dipole = data_key_dipole
+        self.data_key_epsilon = data_key_epsilon
         self.remove_mean = remove_mean
         self.epsilon_factor = epsilon_factor
         self.normalization_factor = epsilon_factor ** 0.5
+        self.epsilon_mode = epsilon_mode
         self.output_index = output_index
         self.compute_bec = compute_bec
         self.compute_dipole = compute_dipole
@@ -427,11 +483,28 @@ class BornEffectiveCharge(nn.Module):
         return pol.reshape(-1), phase
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+        r = data[self.data_key_pos]      # (N, 3), strained, requires_grad
+
+        # Skip guard: batch has BEC refs but none labeled (all NaN filler).
+        if (
+            self.compute_bec
+            and not self.compute_dipole
+            and KEY.LES_BEC_REF in data
+            and bool(torch.isnan(data[KEY.LES_BEC_REF]).all())
+        ):
+            shape = (
+                (r.shape[0], 3) if self.output_index is not None
+                else (r.shape[0], 3, 3)
+            )
+            data[self.data_key_out] = torch.zeros(
+                shape, device=r.device, dtype=r.dtype
+            )
+            return data
+
         q = data[self.data_key_q]
         if q.dim() == 1:
             q = q.unsqueeze(1)
         q = q.sum(dim=1, keepdim=True)   # (N, 1) effective charge
-        r = data[self.data_key_pos]      # (N, 3), strained, requires_grad
 
         if self._is_batch_data:
             batch = data[KEY.BATCH].long()
@@ -444,6 +517,12 @@ class BornEffectiveCharge(nn.Module):
             cell = data[self.data_key_cell].view(-1, 3, 3)
         else:
             cell = torch.zeros((n_graphs, 3, 3), device=r.device, dtype=r.dtype)
+
+        if self.epsilon_mode == 'learned':
+            eps = data[self.data_key_epsilon].reshape(-1)   # (n_graphs,)
+            norm_factors = eps ** 0.5
+        else:
+            norm_factors = None
 
         all_P = []
 
@@ -464,7 +543,11 @@ class BornEffectiveCharge(nn.Module):
             if self.output_index is not None:
                 pol = pol[self.output_index]
                 phase = phase[:, self.output_index]
-            all_P.append(pol * self.normalization_factor)
+            factor = (
+                norm_factors[i] if norm_factors is not None
+                else self.normalization_factor
+            )
+            all_P.append(pol * factor)
             phases[mask] = phase.to(cdtype)
 
         P = torch.stack(all_P, dim=0)          # (n_graphs, 3) or (n_graphs,)

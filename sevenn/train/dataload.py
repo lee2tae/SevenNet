@@ -214,6 +214,12 @@ def atoms_to_graph(
         data[KEY.LES_BEC_REF] = atoms.arrays['bec_dft'].reshape(
             len(atomic_numbers), 3, 3
         )
+    else:
+        # NaN filler so BEC-labeled and unlabeled frames collate into one
+        # batch; BecLoss/error_recorder drop NaN entries (ignore_unlabeled).
+        data[KEY.LES_BEC_REF] = np.full(
+            (len(atomic_numbers), 3, 3), np.nan
+        )
 
     if transfer_info and atoms.info is not None:
         info = copy.deepcopy(atoms.info)

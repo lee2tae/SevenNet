@@ -66,6 +66,8 @@ LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewal
 LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges
 LES_DIPOLE: Final[str] = 'les_dipole'              # (n_graphs, 3) dipole moment / polarization
 LES_BEC_REF: Final[str] = 'les_bec_ref'            # (N_atoms, 3, 3) reference DFT Born charges
+LES_EPS_ATOMIC: Final[str] = 'les_eps_atomic'      # (N_atoms, 1) raw per-atom epsilon feature
+LES_EPS: Final[str] = 'les_epsilon'                # (n_graphs,) predicted epsilon factor
 
 PRED_PER_ATOM_ENERGY: Final[str] = 'inferred_per_atom_energy'
 PER_ATOM_ENERGY: Final[str] = 'per_atom_energy'
