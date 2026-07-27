@@ -9,6 +9,7 @@ import numpy as np
 import sevenn._keys as KEY
 from sevenn.error_recorder import AverageNumber, ErrorRecorder
 from sevenn.logger import Logger
+from sevenn.train.sampler import StratifiedBatchSampler
 from sevenn.train.trainer import Trainer
 from sevenn.util import unique_filepath
 
@@ -77,7 +78,8 @@ def processing_by_batch(
 
     csv_path = unique_filepath(f'{prefix}/lc.csv')
     if write_csv:
-        head = ['epoch', 'lr']
+        # rows are written from csv_dct = {epoch, batch, lr, <metrics>}
+        head = ['epoch', 'batch', 'lr']
         for k, rec in recorders.items():
             head.extend(list(rec.get_dct(prefix=k)))
         with open(csv_path, 'w') as f:
@@ -85,15 +87,25 @@ def processing_by_batch(
 
     train_loader = loaders['trainset']
 
-    if data_progress[KEY.TOTAL_DATA_NUM] < 0:  # fresh start or reset
-        data_progress[KEY.TOTAL_DATA_NUM] = len(train_loader.sampler.sequence)
-    else:  # continue
-        train_loader.sampler.continue_from_data_progress(**data_progress)
+    # StratifiedBatchSampler (joint EFS+BEC) is a batch_sampler whose
+    # sequence/progress are in BATCH units; OrderedSampler counts samples.
+    if isinstance(
+        getattr(train_loader, 'batch_sampler', None), StratifiedBatchSampler
+    ):
+        sampler = train_loader.batch_sampler
+        progress_unit = config[KEY.WORLD_SIZE]
+    else:
+        sampler = train_loader.sampler
+        progress_unit = config[KEY.WORLD_SIZE] * config[KEY.BATCH_SIZE]
 
-    effective_batch_size = config[KEY.WORLD_SIZE] * config[KEY.BATCH_SIZE]
-    start_batch = (data_progress[KEY.CURRENT_DATA_IDX]) // effective_batch_size
-    total_step = data_progress[KEY.TOTAL_DATA_NUM] // effective_batch_size
-    if data_progress[KEY.TOTAL_DATA_NUM] % effective_batch_size != 0:
+    if data_progress[KEY.TOTAL_DATA_NUM] < 0:  # fresh start or reset
+        data_progress[KEY.TOTAL_DATA_NUM] = len(sampler.sequence)
+    else:  # continue
+        sampler.continue_from_data_progress(**data_progress)
+
+    start_batch = (data_progress[KEY.CURRENT_DATA_IDX]) // progress_unit
+    total_step = data_progress[KEY.TOTAL_DATA_NUM] // progress_unit
+    if data_progress[KEY.TOTAL_DATA_NUM] % progress_unit != 0:
         total_step += 1
     save_per_epoch = int(1 / per_epoch)
     save_batch_idx = np.linspace(1, total_step, save_per_epoch + 1)
@@ -102,8 +114,8 @@ def processing_by_batch(
     if data_progress[KEY.TOTAL_DATA_NUM] == data_progress[KEY.CURRENT_DATA_IDX]:
         start_epoch += 1  # continuing from end of epoch
         start_batch = 0
-        train_loader.sampler.permutate_sequence()  # update rng state
-        train_loader.sampler.refresh_sequence()  # make starting index to zero
+        sampler.permutate_sequence()  # update rng state
+        sampler.refresh_sequence()  # make starting index to zero
 
     trainer.write_checkpoint(
         f'{prefix}/checkpoint_initial.pth',
@@ -142,7 +154,7 @@ def processing_by_batch(
     for epoch in range(start_epoch, total_epoch + 1):  # one indexing
         # rng state captured ONCE at epoch start; every leg resumes from this
         # so each leg reproduces the same permutation for this epoch.
-        epoch_rng_state = train_loader.sampler.get_rng_state()
+        epoch_rng_state = sampler.get_rng_state()
         data_progress[KEY.NUMPY_RNG_STATE] = epoch_rng_state
         log.timer_start('epoch')
         log.timer_start('batch')
@@ -166,10 +178,10 @@ def processing_by_batch(
             if restart_workers:
                 # respawn fresh workers and resume sampler at the exact position
                 consumed = min(
-                    current_batch_idx * effective_batch_size,
+                    current_batch_idx * progress_unit,
                     data_progress[KEY.TOTAL_DATA_NUM],
                 )
-                train_loader.sampler.continue_from_data_progress(
+                sampler.continue_from_data_progress(
                     numpy_rng_state=epoch_rng_state,
                     total_data_num=data_progress[KEY.TOTAL_DATA_NUM],
                     current_data_index=consumed,
@@ -222,7 +234,7 @@ def processing_by_batch(
                         else ''
                     )
                     data_progress[KEY.CURRENT_DATA_IDX] = min(
-                        current_batch_idx * effective_batch_size,
+                        current_batch_idx * progress_unit,
                         data_progress[KEY.TOTAL_DATA_NUM],
                     )
                     trainer.write_checkpoint(

@@ -47,6 +47,7 @@ class Trainer:
         device: Union[torch.device, str] = 'auto',
         distributed: bool = False,
         distributed_backend: str = 'nccl',
+        loss_scale_ref: Optional[Dict[str, int]] = None,
     ) -> None:
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -82,6 +83,10 @@ class Trainer:
         else:
             self.scheduler = None
         self.loss_functions = loss_functions
+        # {loss name (lower) -> reference batch size}: each batch's loss term
+        # is scaled by n_graphs/ref so per-frame weights stay uniform across
+        # stratified batch sizes (becset scheme). None -> plain batch means.
+        self.loss_scale_ref = loss_scale_ref
         self.reg_functions = reg_functions or []
         self.grad_clip_norm_th = grad_clip_norm_th
 
@@ -90,10 +95,18 @@ class Trainer:
         reg_functions = get_regularization_from_config(
             config, list(model._modules.keys())
         )
+        loss_scale_ref = None
+        if config.get(KEY.STRATIFIED_LOSS_RESCALE, False):
+            bs = config[KEY.BATCH_SIZE]
+            bbs = config.get(KEY.BEC_BATCH_SIZE) or bs
+            loss_scale_ref = {
+                'energy': bs, 'force': bs, 'stress': bs, 'bec': bbs,
+            }
         trainer = Trainer(
             model,
             loss_functions=get_loss_functions_from_config(config),
             reg_functions=reg_functions,
+            loss_scale_ref=loss_scale_ref,
             optimizer_cls=optim_dict[config.get(KEY.OPTIMIZER, 'adam').lower()],
             optimizer_args=config.get(KEY.OPTIM_PARAM, {}),
             scheduler_cls=scheduler_dict[
@@ -181,6 +194,7 @@ class Trainer:
                 for loss_def, w in self.loss_functions:
                     indv_loss = loss_def.get_loss(output, _model)
                     if indv_loss is not None:
+                        w = w * self._batch_loss_scale(loss_def, output)
                         total_loss += (indv_loss * w)
                 for reg_def, w in self.reg_functions:
                     reg_loss = reg_def.get_loss(output, _model)
@@ -195,6 +209,14 @@ class Trainer:
 
         if self.distributed and error_recorder is not None:
             self.recorder_all_reduce(error_recorder)
+
+    def _batch_loss_scale(self, loss_def: LossDefinition, output) -> float:
+        if self.loss_scale_ref is None:
+            return 1.0
+        ref = self.loss_scale_ref.get(loss_def.name.lower())
+        if not ref:
+            return 1.0
+        return len(output[KEY.NUM_ATOMS]) / ref
 
     def train_one_batch(
         self,
@@ -219,6 +241,7 @@ class Trainer:
 
         total_loss = torch.tensor([0.0], device=self.device)
         for loss_def, w in self.loss_functions:
+            w = w * self._batch_loss_scale(loss_def, output)
             total_loss += loss_def.get_loss(output, _model) * w
         for reg_def, w in self.reg_functions:
             reg_loss = reg_def.get_loss(output, _model)

@@ -1,5 +1,6 @@
 import importlib.util
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,20 @@ from sevenn.scripts.processing_continue import (
 )
 from sevenn.train.sampler import OrderedSampler
 from sevenn.train.trainer import Trainer
+
+
+def _enable_batched_bec_autograd(config: Dict[str, Any]) -> None:
+    # BEC training computes all BEC components in one vmapped backward,
+    # which e3nn's TorchScript-compiled kernels do not support. Disable the
+    # TorchScript codegen (training-process only; deploy is unaffected).
+    if not config.get(KEY.IS_TRAIN_BEC, False):
+        return
+    import e3nn
+    e3nn.set_optimization_defaults(jit_script_fx=False)
+    Logger().writeline(
+        'is_train_bec: e3nn TorchScript codegen disabled '
+        'to enable batched BEC autograd'
+    )
 
 
 def loader_from_config(
@@ -80,6 +95,60 @@ def loader_from_config(
     return DataLoader(**loader_args)
 
 
+def bec_joint_loader_from_config(
+    config: Dict[str, Any],
+    efs_dataset: Dataset,
+    bec_dataset: Dataset,
+) -> DataLoader:
+    """
+    Single train loader over the EFS and BEC datasets with homogeneous
+    batches (StratifiedBatchSampler): a batch is either pure-EFS at
+    `batch_size` or pure-BEC at `bec_batch_size`, in shuffled order.
+    """
+    from torch.utils.data import ConcatDataset
+
+    from sevenn.train.sampler import StratifiedBatchSampler
+
+    if not config.get(KEY.IS_TRAIN_BEC, False):
+        warnings.warn(
+            'load_becset_path is given but is_train_bec is False; '
+            'BEC references in the becset will not be trained on.'
+        )
+
+    batch_size = config[KEY.BATCH_SIZE]
+    bec_batch_size = config.get(KEY.BEC_BATCH_SIZE) or batch_size
+
+    world_size, rank = 1, 0
+    if config[KEY.IS_DDP]:
+        dist.barrier()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+    batch_sampler = StratifiedBatchSampler(
+        group_sizes=[len(efs_dataset), len(bec_dataset)],
+        batch_sizes=[batch_size, bec_batch_size],
+        shuffle=config[KEY.TRAIN_SHUFFLE],
+        seed=config.get(KEY.RANDOM_SEED, 777),
+        world_size=world_size,
+        rank=rank,
+    )
+    Logger().writeline(
+        f'Joint EFS+BEC training: {len(efs_dataset)} EFS frames '
+        f'(batch {batch_size}) + {len(bec_dataset)} BEC frames '
+        f'(batch {bec_batch_size}), {len(batch_sampler)} batches/epoch/rank'
+    )
+
+    loader_args: Dict[str, Any] = {
+        'dataset': ConcatDataset([efs_dataset, bec_dataset]),
+        'batch_sampler': batch_sampler,
+    }
+    if KEY.NUM_WORKERS in config and config[KEY.NUM_WORKERS] > 0:
+        loader_args.update({'num_workers': config[KEY.NUM_WORKERS]})
+    if (loader_kwargs := config.get(KEY.LOADER_KWARGS, None)) is not None:
+        loader_args.update(**loader_kwargs)
+    return DataLoader(**loader_args)
+
+
 def update_config_for_batch_training(config: Dict[str, Any], train_loader) -> None:
     """
     Update scheduler parameters for batch-level training.
@@ -88,10 +157,17 @@ def update_config_for_batch_training(config: Dict[str, Any], train_loader) -> No
     when using batch training mode.
     """
     # convert float type `epoch` related parameters for batch training
-    effective_batch_size = config[KEY.WORLD_SIZE] * config[KEY.BATCH_SIZE]
-    steps_per_epoch = math.ceil(
-        train_loader.sampler.total_size / effective_batch_size
-    )
+    from sevenn.train.sampler import StratifiedBatchSampler
+
+    if isinstance(
+        getattr(train_loader, 'batch_sampler', None), StratifiedBatchSampler
+    ):
+        steps_per_epoch = train_loader.batch_sampler.batches_per_rank
+    else:
+        effective_batch_size = config[KEY.WORLD_SIZE] * config[KEY.BATCH_SIZE]
+        steps_per_epoch = math.ceil(
+            train_loader.sampler.total_size / effective_batch_size
+        )
 
     scheduler_type = config.get(KEY.SCHEDULER, 'exponentiallr').lower()
     scheduler_param = config.get(KEY.SCHEDULER_PARAM, {})
@@ -210,15 +286,23 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
     else:
         raise ValueError(f'Unknown dataset type: {dataset_type}')
 
+    # BEC-labeled second train stream: merged into trainset with homogeneous
+    # batches instead of getting an eval-only loader like other load_*_path.
+    bec_dataset = datasets.pop('becset', None)
     loaders = {
         k: loader_from_config(config, v, dataset_key=k) for k, v in datasets.items()
     }
+    if bec_dataset is not None:
+        loaders['trainset'] = bec_joint_loader_from_config(
+            config, datasets['trainset'], bec_dataset
+        )
 
     # Update scheduler config for batch training
     if train_by_batch:
         update_config_for_batch_training(config, loaders['trainset'])
 
     log.write('\nModel building...\n')
+    _enable_batched_bec_autograd(config)
     model = build_E3_equivariant_model(config)
     log.print_model_info(model, config)
 
@@ -294,6 +378,7 @@ def train(config, working_dir: str):
     loaders = list(loaders.values())
 
     log.write('\nModel building...\n')
+    _enable_batched_bec_autograd(config)
     model = build_E3_equivariant_model(config)
 
     log.write('Model building was successful\n')

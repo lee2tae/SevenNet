@@ -24,6 +24,7 @@ References:
   - LES library: https://github.com/ChengUCB/les
   - NequIP-LES:  https://github.com/ChengUCB/nequip-les
 """
+import warnings
 from typing import Optional
 
 import torch
@@ -358,9 +359,10 @@ class NeutralizeCharge(nn.Module):
 
 class EpsilonFactorReadout(nn.Module):
     """
-    Per-graph epsilon factor from per-atom raw values (KEY.LES_EPS_ATOMIC):
-        eps_g = softplus(mean_i(x_i) + c0)
-    c0 = softplus^-1(1) so eps_g = 1 at zero-initialised input, matching the
+    Epsilon factor from per-atom raw values (KEY.LES_EPS_ATOMIC):
+        mode='graph': eps_g = softplus(mean_i(x_i) + c0)   -> (n_graphs,)
+        mode='atom':  eps_i = softplus(x_i + c0)           -> (N_atoms,)
+    c0 = softplus^-1(1) so eps = 1 at zero-initialised input, matching the
     fixed epsilon_factor=1.0 default. Supervised only through the BEC loss;
     E/F/s gradients never reach it.
     """
@@ -371,14 +373,27 @@ class EpsilonFactorReadout(nn.Module):
         self,
         data_key_in: str = KEY.LES_EPS_ATOMIC,
         data_key_out: str = KEY.LES_EPS,
+        mode: str = 'graph',
     ):
         super().__init__()
+        if mode not in ('graph', 'atom'):
+            raise ValueError(
+                f"Unknown EpsilonFactorReadout mode: {mode!r}. "
+                "Choose from 'graph' | 'atom'."
+            )
         self.key_input = data_key_in
         self.key_output = data_key_out
+        self.mode = mode
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         x = data[self.key_input].reshape(-1)   # (N_atoms,)
+        if self.mode == 'atom':
+            data[self.key_output] = torch.nn.functional.softplus(
+                x + self._SOFTPLUS_INV_ONE
+            )
+            return data
+
         if self._is_batch_data:
             batch = data[KEY.BATCH].long()
             n_graphs = int(batch.max().item()) + 1
@@ -406,6 +421,10 @@ class BornEffectiveCharge(nn.Module):
         'fixed'   → P is scaled by sqrt(epsilon_factor) (build-time constant).
         'learned' → P is scaled by sqrt(data[KEY.LES_EPS]) per graph, predicted
                     by EpsilonFactorReadout upstream.
+        'learned_atomic' → per-atom screening: q_i is scaled by sqrt(eps_i)
+                    BEFORE remove_mean, so the screened charges are
+                    re-neutralized and the acoustic sum rule survives.
+                    data[KEY.LES_EPS] holds per-atom eps (N,).
     """
 
     def __init__(
@@ -424,10 +443,10 @@ class BornEffectiveCharge(nn.Module):
         compute_dipole: bool = False,
     ):
         super().__init__()
-        if epsilon_mode not in ('fixed', 'learned'):
+        if epsilon_mode not in ('fixed', 'learned', 'learned_atomic'):
             raise ValueError(
                 f"Unknown epsilon_mode: {epsilon_mode!r}. "
-                "Choose from 'fixed' | 'learned'."
+                "Choose from 'fixed' | 'learned' | 'learned_atomic'."
             )
         self.data_key_q = data_key_q
         self.data_key_pos = data_key_pos
@@ -443,6 +462,9 @@ class BornEffectiveCharge(nn.Module):
         self.compute_bec = compute_bec
         self.compute_dipole = compute_dipole
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+        # One vmapped VJP for all BEC components; flips off permanently if an
+        # op in the backward graph has no vmap batching rule.
+        self._use_batched_grad = True
 
     def _grad_real(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # d y / d x
@@ -474,13 +496,49 @@ class BornEffectiveCharge(nn.Module):
             return self._grad_real(y.real, x) + 1j * self._grad_real(y.imag, x)
         return self._grad_real(y, x)
 
-    def _pol_pbc(self, r_now, q_now, box):
-        # Berry-phase-style polarization for a periodic cell.
-        r_frac = torch.matmul(r_now, torch.linalg.inv(box))
-        phase = torch.exp(1j * 2.0 * torch.pi * r_frac)          # (n, 3)
-        S = torch.sum(q_now * phase, dim=0)                      # (3,)
-        pol = torch.matmul(box.to(S.dtype), S.unsqueeze(1)) / (1j * 2.0 * torch.pi)
-        return pol.reshape(-1), phase
+    def _polarization(self, q, r, cell, batch, n_graphs, factors):
+        # Berry-phase-style polarization, vectorized over graphs.
+        # Returns P (n_graphs, 3) complex and per-atom phase (N, 3) complex.
+        cdtype = torch.complex128 if r.dtype == torch.float64 else torch.complex64
+        pbc = torch.linalg.det(cell).abs() >= 1e-6               # (G,)
+        eye = torch.eye(3, device=r.device, dtype=r.dtype)
+        safe_cell = torch.where(pbc.view(-1, 1, 1), cell, eye)
+        r_frac = torch.einsum('nd,nde->ne', r, torch.linalg.inv(safe_cell)[batch])
+        phase = torch.exp(1j * 2.0 * torch.pi * r_frac)          # (N, 3)
+        S = torch.zeros(n_graphs, 3, device=r.device, dtype=cdtype)
+        S.index_add_(0, batch, q * phase)
+        pol_pbc = (
+            torch.einsum('gab,gb->ga', safe_cell.to(cdtype), S)
+            / (1j * 2.0 * torch.pi)
+        )
+        pol_open = torch.zeros(n_graphs, 3, device=r.device, dtype=r.dtype)
+        pol_open.index_add_(0, batch, q * r)
+        P = torch.where(pbc.unsqueeze(1), pol_pbc, pol_open.to(cdtype))
+        phase = torch.where(pbc[batch].unsqueeze(1), phase, torch.ones_like(phase))
+        return P * factors.unsqueeze(1), phase
+
+    def _bec_grad_batched(self, P, r, phase):
+        # All Cartesian x {real, imag} cotangents in one vmapped backward.
+        n_graphs = P.shape[0]
+        if P.dim() == 1:                                          # output_index set
+            Y = torch.stack([P.real, P.imag])                     # (2, G)
+        else:
+            Y = torch.stack([P.real, P.imag]).permute(0, 2, 1).reshape(6, n_graphs)
+        C = Y.shape[0]
+        cot = torch.eye(C, device=r.device, dtype=r.dtype)
+        cot = cot.unsqueeze(-1).expand(C, C, n_graphs)
+        (g,) = torch.autograd.grad(
+            [Y], [r],
+            grad_outputs=[cot],
+            retain_graph=True,
+            create_graph=self.training,
+            is_grads_batched=True,
+        )                                                         # (C, N, 3)
+        if C == 2:
+            bec = g[0] + 1j * g[1]                                # (N, b)
+            return (bec * phase.conj().unsqueeze(1)).real
+        bec = (g[0:3] + 1j * g[3:6]).permute(1, 0, 2)             # (N, a, b)
+        return (bec * phase.conj().unsqueeze(2)).real
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         r = data[self.data_key_pos]      # (N, 3), strained, requires_grad
@@ -518,39 +576,31 @@ class BornEffectiveCharge(nn.Module):
         else:
             cell = torch.zeros((n_graphs, 3, 3), device=r.device, dtype=r.dtype)
 
-        if self.epsilon_mode == 'learned':
-            eps = data[self.data_key_epsilon].reshape(-1)   # (n_graphs,)
-            norm_factors = eps ** 0.5
+        if self.epsilon_mode == 'learned_atomic':
+            # screened charges; remove_mean below re-neutralizes them so the
+            # acoustic sum rule survives (scale BEFORE neutralize)
+            eps_atom = data[self.data_key_epsilon].reshape(-1, 1)  # (N, 1)
+            q = q * eps_atom.sqrt()
+            factors = torch.ones(n_graphs, device=r.device, dtype=r.dtype)
+        elif self.epsilon_mode == 'learned':
+            factors = data[self.data_key_epsilon].reshape(-1) ** 0.5  # (n_graphs,)
         else:
-            norm_factors = None
-
-        all_P = []
-
-        cdtype = torch.complex128 if r.dtype == torch.float64 else torch.complex64
-        phase_shape = (r.shape[0],) if self.output_index is not None else r.shape
-        phases = torch.zeros(phase_shape, dtype=cdtype, device=r.device)
-        for i in range(n_graphs):
-            mask = batch == i
-            r_now, q_now = r[mask], q[mask]
-            if self.remove_mean:
-                q_now = q_now - q_now.mean(dim=0, keepdim=True)
-            box = cell[i]
-            if torch.linalg.det(box).abs() < 1e-6:
-                pol = torch.sum(q_now * r_now, dim=0)            # (3,)
-                phase = torch.ones_like(r_now, dtype=cdtype)
-            else:
-                pol, phase = self._pol_pbc(r_now, q_now, box)
-            if self.output_index is not None:
-                pol = pol[self.output_index]
-                phase = phase[:, self.output_index]
-            factor = (
-                norm_factors[i] if norm_factors is not None
-                else self.normalization_factor
+            factors = torch.full(
+                (n_graphs,), self.normalization_factor,
+                device=r.device, dtype=r.dtype,
             )
-            all_P.append(pol * factor)
-            phases[mask] = phase.to(cdtype)
 
-        P = torch.stack(all_P, dim=0)          # (n_graphs, 3) or (n_graphs,)
+        if self.remove_mean:
+            sum_q = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
+            cnt = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
+            sum_q.index_add_(0, batch, q)
+            cnt.index_add_(0, batch, torch.ones_like(q))
+            q = q - (sum_q / cnt.clamp(min=1.0))[batch]
+
+        P, phases = self._polarization(q, r, cell, batch, n_graphs, factors)
+        if self.output_index is not None:
+            P = P[:, self.output_index]                   # (n_graphs,)
+            phases = phases[:, self.output_index]         # (N,)
 
         if self.compute_dipole:
             dip = P.real
@@ -559,13 +609,28 @@ class BornEffectiveCharge(nn.Module):
             )
 
         if self.compute_bec:
-            if self.output_index is None:
-                # grad -> (N, b, a); transpose so index1=P-comp a, index2=r-comp b
-                bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
-                result = bec * phases.unsqueeze(2).conj()             # dephase over a
-            else:
-                bec = self._grad(P, r)                                # (N, 3)
-                result = bec * phases.unsqueeze(1).conj()
-            data[self.data_key_out] = result.real
+            result = None
+            if self._use_batched_grad:
+                try:
+                    result = self._bec_grad_batched(P, r, phases)
+                except torch.OutOfMemoryError:
+                    raise  # fallback loop uses MORE memory; do not mask OOM
+                except RuntimeError as e:
+                    self._use_batched_grad = False
+                    warnings.warn(
+                        'Batched BEC autograd failed, falling back to the '
+                        f'per-component loop: {e}\nFor faster BEC training, '
+                        'call e3nn.set_optimization_defaults(jit_script_fx='
+                        'False) before building the model.'
+                    )
+            if result is None:
+                if self.output_index is None:
+                    # grad -> (N, b, a); transpose so index1=P-comp a, index2=r-comp b
+                    bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
+                    result = (bec * phases.unsqueeze(2).conj()).real
+                else:
+                    bec = self._grad(P, r)                                # (N, 3)
+                    result = (bec * phases.unsqueeze(1).conj()).real
+            data[self.data_key_out] = result
 
         return data

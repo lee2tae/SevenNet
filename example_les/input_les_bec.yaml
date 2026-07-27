@@ -1,5 +1,11 @@
-# Example input.yaml for training SevenNet with LES (Latent Ewald Summation).
-# E/F/stress training only; see input_les_bec.yaml for joint BEC training.
+# Example input.yaml for joint E/F/stress + BEC training with SevenNet-LES.
+#
+# Two train streams:
+#   load_trainset_path -> E/F/stress-only frames (large batches)
+#   load_becset_path   -> BEC-labeled frames    (small batches; a BEC training
+#                         step costs ~3.8x the memory of an E/F/s step)
+# Batches are homogeneous (pure-EFS or pure-BEC) in shuffled order, so BEC
+# frames never inflate the memory of EFS batches and shuffling stays on.
 
 model:
     chemical_species: 'univ'
@@ -58,14 +64,18 @@ model:
         fukui_hidden_channels: [8]                # 'fukui' only: hidden widths of the Fukui-weight readout MLP. [] -> single IrrepsLinear.
         fukui_zero_init: False                    # 'fukui' only: zero-init the Fukui readout.
 
+        epsilon_mode: learned                     # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom
+                                                  # screening: q_i scaled by sqrt(eps_i) then re-neutralized). BEC loss only.
+        epsilon_hidden_channels: [16]             # Hidden widths of the epsilon readout MLP. [] -> single IrrepsLinear.
+
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
-        compute_bec: False                        # Compute Born effective charges at inference (parameter-free readout).
 
 train:
     train_shuffle: True
     random_seed: 77777777
     is_train_stress : True
-    epoch: 2000
+    is_train_bec: True                            # Adds the BEC loss; becset frames supervise it.
+    epoch: 1000
 
     loss:
         energy:
@@ -77,6 +87,9 @@ train:
         stress:
             loss_weight: 0.0001
             loss_type: 'l2mae'
+        bec:
+            loss_weight: 0.1
+            loss_type: 'l2mae'
 
     optimizer: 'adam'
     optim_param:
@@ -84,7 +97,7 @@ train:
     scheduler: 'onecyclelr'
     scheduler_param:
         max_lr: 0.02
-        epochs: 2000
+        epochs: 1000
         pct_start: 0.05
         anneal_strategy: 'cos'
         div_factor: 25.0
@@ -97,6 +110,8 @@ train:
         - ['Energy', 'Loss']
         - ['Force', 'Loss']
         - ['Stress', 'Loss']
+        - ['BEC', 'MAE']
+        - ['BEC', 'Loss']
         - ['TotalLoss', 'None']
 
     per_epoch: 1
@@ -104,7 +119,8 @@ train:
     use_modality: False
 
 data:
-    batch_size: 64  # per GPU batch size, as the model trained with 32 GPUs, the effective batch size equals 4096.
+    batch_size: 64      # EFS batches. per GPU batch size.
+    bec_batch_size: 8   # BEC batches. Rule of thumb: ~6 GiB peak per 1000 atoms in a BEC batch.
     shift: -4.532467842102051  # fake
     scale: 1.964433980617986   # fake
 
@@ -113,4 +129,5 @@ data:
 
     dataset_type: 'graph'
     load_trainset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_train.extxyz'
-    load_validset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_valid.extxyz'
+    load_becset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_test.extxyz'
+    load_validset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_joint_valid.extxyz'

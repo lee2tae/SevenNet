@@ -665,13 +665,13 @@ def build_E3_equivariant_model(
             or config.get(KEY.IS_TRAIN_BEC, False)
         )
         _epsilon_mode = les_cfg.get('epsilon_mode', 'fixed')
-        if _epsilon_mode not in ('fixed', 'learned'):
+        if _epsilon_mode not in ('fixed', 'learned', 'learned_atomic'):
             raise ValueError(
                 f"Unknown epsilon_mode: {_epsilon_mode!r}. "
-                "Choose from 'fixed' | 'learned'."
+                "Choose from 'fixed' | 'learned' | 'learned_atomic'."
             )
         # Epsilon head also reads full node features, so it sits here too.
-        if _bec_needed and _epsilon_mode == 'learned':
+        if _bec_needed and _epsilon_mode in ('learned', 'learned_atomic'):
             layers['les_epsilon_readout'] = LatentChargeReadout(
                 irreps_in=irreps_x,  # type: ignore
                 data_key_in=KEY.NODE_FEATURE,
@@ -679,7 +679,9 @@ def build_E3_equivariant_model(
                 n_charges=1,
                 hidden_channels=les_cfg.get('epsilon_hidden_channels', None),
             )
-            layers['les_epsilon_pool'] = EpsilonFactorReadout()
+            layers['les_epsilon_pool'] = EpsilonFactorReadout(
+                mode='atom' if _epsilon_mode == 'learned_atomic' else 'graph'
+            )
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 

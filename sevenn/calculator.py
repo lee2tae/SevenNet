@@ -179,6 +179,14 @@ class SevenNetCalculator(Calculator):
             )
             model_loaded.set_is_batch_data(False)
 
+            # is_train_bec checkpoints build the BEC module unconditionally
+            # (model_build ORs the flag in); compute only what this
+            # calculator was asked for.
+            if 'les_bec' in model_loaded._modules:
+                bec_module = model_loaded._modules['les_bec']
+                bec_module.compute_bec = compute_bec
+                bec_module.compute_dipole = compute_dipole
+
             # Post-build so a learned-epsilon checkpoint still loads its
             # state_dict (epsilon head modules must exist at load time).
             if epsilon_factor is not None and 'les_bec' in model_loaded._modules:
@@ -302,10 +310,16 @@ class SevenNetCalculator(Calculator):
             results['dipole'] = (
                 output[KEY.LES_DIPOLE].detach().cpu().numpy().reshape(-1)[:3]
             )
+        if KEY.LES_Q in output:
+            q = output[KEY.LES_Q].detach().cpu().numpy()
+            results['les_charges'] = q.reshape(q.shape[0], -1).sum(1)[:num_atoms]
         if KEY.LES_EPS in output and self.epsilon_factor is None:
-            results['epsilon_factor'] = float(
-                output[KEY.LES_EPS].detach().cpu().reshape(-1)[0]
-            )
+            eps = output[KEY.LES_EPS].detach().cpu().numpy().reshape(-1)
+            if eps.size > 1:  # epsilon_mode='learned_atomic': per-atom eps
+                results['epsilon_atomic'] = eps[:num_atoms]
+                results['epsilon_factor'] = float(eps[:num_atoms].mean())
+            else:
+                results['epsilon_factor'] = float(eps[0])
         return results
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
