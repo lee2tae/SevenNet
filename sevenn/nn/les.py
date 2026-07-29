@@ -360,11 +360,8 @@ class NeutralizeCharge(nn.Module):
 class EpsilonFactorReadout(nn.Module):
     """
     Epsilon factor from per-atom raw values (KEY.LES_EPS_ATOMIC):
-        mode='graph': eps_g = softplus(mean_i(x_i) + c0)   -> (n_graphs,)
-        mode='atom':  eps_i = softplus(x_i + c0)           -> (N_atoms,)
-    c0 = softplus^-1(1) so eps = 1 at zero-initialised input, matching the
-    fixed epsilon_factor=1.0 default. Supervised only through the BEC loss;
-    E/F/s gradients never reach it.
+        mode='graph': eps_g = act(mean_i(x_i))   -> (n_graphs,)
+        mode='atom':  eps_i = act(x_i)           -> (N_atoms,)
     """
 
     _SOFTPLUS_INV_ONE = 0.5413248546129181
@@ -374,6 +371,7 @@ class EpsilonFactorReadout(nn.Module):
         data_key_in: str = KEY.LES_EPS_ATOMIC,
         data_key_out: str = KEY.LES_EPS,
         mode: str = 'graph',
+        min_one: bool = False,
     ):
         super().__init__()
         if mode not in ('graph', 'atom'):
@@ -384,14 +382,18 @@ class EpsilonFactorReadout(nn.Module):
         self.key_input = data_key_in
         self.key_output = data_key_out
         self.mode = mode
+        self.min_one = min_one
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+
+    def _activate(self, x: torch.Tensor) -> torch.Tensor:
+        if self.min_one:
+            return 1.0 + torch.nn.functional.softplus(x)
+        return torch.nn.functional.softplus(x + self._SOFTPLUS_INV_ONE)
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         x = data[self.key_input].reshape(-1)   # (N_atoms,)
         if self.mode == 'atom':
-            data[self.key_output] = torch.nn.functional.softplus(
-                x + self._SOFTPLUS_INV_ONE
-            )
+            data[self.key_output] = self._activate(x)
             return data
 
         if self._is_batch_data:
@@ -407,9 +409,7 @@ class EpsilonFactorReadout(nn.Module):
         count.scatter_add_(0, batch, torch.ones_like(x))
         mean_x = sum_x / count.clamp(min=1.0)
 
-        data[self.key_output] = torch.nn.functional.softplus(
-            mean_x + self._SOFTPLUS_INV_ONE
-        )
+        data[self.key_output] = self._activate(mean_x)
         return data
 
 
@@ -422,7 +422,7 @@ class BornEffectiveCharge(nn.Module):
         'learned' → P is scaled by sqrt(data[KEY.LES_EPS]) per graph, predicted
                     by EpsilonFactorReadout upstream.
         'learned_atomic' → per-atom screening: q_i is scaled by sqrt(eps_i)
-                    BEFORE remove_mean, so the screened charges are
+                    BEFORE neutralization, so the screened charges are
                     re-neutralized and the acoustic sum rule survives.
                     data[KEY.LES_EPS] holds per-atom eps (N,).
     """
@@ -435,7 +435,7 @@ class BornEffectiveCharge(nn.Module):
         data_key_out: str = KEY.LES_BEC,
         data_key_dipole: str = KEY.LES_DIPOLE,
         data_key_epsilon: str = KEY.LES_EPS,
-        remove_mean: bool = True,
+        remove_mean: str = 'uniform',
         epsilon_factor: float = 1.0,
         epsilon_mode: str = 'fixed',
         output_index: Optional[int] = None,
@@ -447,6 +447,18 @@ class BornEffectiveCharge(nn.Module):
             raise ValueError(
                 f"Unknown epsilon_mode: {epsilon_mode!r}. "
                 "Choose from 'fixed' | 'learned' | 'learned_atomic'."
+            )
+        if isinstance(remove_mean, bool):
+            remove_mean = 'uniform' if remove_mean else 'none'
+        if remove_mean not in ('none', 'uniform', 'q_projection'):
+            raise ValueError(
+                f"Unknown remove_mean: {remove_mean!r}. "
+                "Choose from 'none' | 'uniform' | 'q_projection'."
+            )
+        if remove_mean == 'q_projection' and epsilon_mode != 'learned_atomic':
+            raise ValueError(
+                "remove_mean='q_projection' requires "
+                "epsilon_mode='learned_atomic'."
             )
         self.data_key_q = data_key_q
         self.data_key_pos = data_key_pos
@@ -577,10 +589,18 @@ class BornEffectiveCharge(nn.Module):
             cell = torch.zeros((n_graphs, 3, 3), device=r.device, dtype=r.dtype)
 
         if self.epsilon_mode == 'learned_atomic':
-            # screened charges; remove_mean below re-neutralizes them so the
-            # acoustic sum rule survives (scale BEFORE neutralize)
+            # scale BEFORE neutralize so the acoustic sum rule survives
             eps_atom = data[self.data_key_epsilon].reshape(-1, 1)  # (N, 1)
-            q = q * eps_atom.sqrt()
+            q_scaled = q * eps_atom.sqrt()
+            if self.remove_mean == 'q_projection':
+                # min-norm correction to sqrt(eps) - 1 s.t. sum q = 0
+                S = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
+                D = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
+                S.index_add_(0, batch, q_scaled)
+                D.index_add_(0, batch, q * q)
+                q = q_scaled - (q * q) * (S / D.clamp(min=1e-8))[batch]
+            else:
+                q = q_scaled
             factors = torch.ones(n_graphs, device=r.device, dtype=r.dtype)
         elif self.epsilon_mode == 'learned':
             factors = data[self.data_key_epsilon].reshape(-1) ** 0.5  # (n_graphs,)
@@ -590,7 +610,7 @@ class BornEffectiveCharge(nn.Module):
                 device=r.device, dtype=r.dtype,
             )
 
-        if self.remove_mean:
+        if self.remove_mean == 'uniform':
             sum_q = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
             cnt = torch.zeros(n_graphs, 1, device=q.device, dtype=q.dtype)
             sum_q.index_add_(0, batch, q)

@@ -62,11 +62,12 @@ model:
         # Charge neutralization: enforce per-graph total charge = 0 before the Ewald sum.
         neutralize_mode: fukui                    # Default: 'none'. | 'shift' (subtract per-graph mean) | 'fukui' (learned redistribution)
         fukui_hidden_channels: [8]                # 'fukui' only: hidden widths of the Fukui-weight readout MLP. [] -> single IrrepsLinear.
-        fukui_zero_init: False                    # 'fukui' only: zero-init the Fukui readout.
+        fukui_zero_init: False
 
-        epsilon_mode: learned                     # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom
-                                                  # screening: q_i scaled by sqrt(eps_i) then re-neutralized). BEC loss only.
+        epsilon_mode: learned                     # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom eps)
         epsilon_hidden_channels: [16]             # Hidden widths of the epsilon readout MLP. [] -> single IrrepsLinear.
+        epsilon_min_one: True                     # Default. True (anti-screening prohibited)
+        remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'
 
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
 

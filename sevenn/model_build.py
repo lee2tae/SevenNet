@@ -680,7 +680,8 @@ def build_E3_equivariant_model(
                 hidden_channels=les_cfg.get('epsilon_hidden_channels', None),
             )
             layers['les_epsilon_pool'] = EpsilonFactorReadout(
-                mode='atom' if _epsilon_mode == 'learned_atomic' else 'graph'
+                mode='atom' if _epsilon_mode == 'learned_atomic' else 'graph',
+                min_one=les_cfg.get('epsilon_min_one', False),
             )
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
@@ -721,13 +722,12 @@ def build_E3_equivariant_model(
         )
 
     if config.get(KEY.USE_LES, False) and _bec_needed:
-        les_bec_args = les_cfg.get('les_args', {})
         layers['les_bec'] = BornEffectiveCharge(
             data_key_q=KEY.LES_Q,
             data_key_out=KEY.LES_BEC,
             data_key_dipole=KEY.LES_DIPOLE,
-            remove_mean=les_bec_args.get('remove_mean', True),
-            epsilon_factor=les_bec_args.get('epsilon_factor', 1.0),
+            remove_mean=les_cfg.get('remove_mean', 'uniform'),
+            epsilon_factor=les_cfg.get('epsilon_factor', 1.0),
             epsilon_mode=_epsilon_mode,
             output_index=les_cfg.get('bec_output_index', None),
             compute_bec=(
