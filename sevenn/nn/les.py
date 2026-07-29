@@ -139,11 +139,9 @@ class LatentEwaldSum(nn.Module):
     _strain (complete stress: SR virial + LR positional + LR cell/k-space).
 
     Args:
-        les_args:         kwargs forwarded to Les().
-        data_key_in:      per-atom latent charges (N_atoms, n_charges).
-        data_key_out:     per-graph LR energy output.
-        compute_bec:      if True, compute Born effective charges.
-        bec_output_index: 0/1/2 for x/y/z component of BEC.
+        les_args:     dl / sigma / remove_self_interaction settings.
+        data_key_in:  per-atom latent charges (N_atoms, n_charges).
+        data_key_out: per-graph LR energy output.
     """
 
     def __init__(
@@ -151,26 +149,15 @@ class LatentEwaldSum(nn.Module):
         les_args: Optional[dict] = None,
         data_key_in: str = KEY.LES_Q,
         data_key_out: str = KEY.LR_ENERGY,
-        compute_bec: bool = False,
-        bec_output_index: Optional[int] = None,
         ewald_type: str = 'batched',
     ):
         super().__init__()
         if les_args is None:
-            les_args = {'use_atomwise': False}
+            les_args = {}
         self.key_input = data_key_in
         self.key_output = data_key_out
-        self.compute_bec = compute_bec
-        self.bec_output_index = bec_output_index
-        if compute_bec:
-            raise ValueError(
-                'compute_bec=True is not supported'
-            )
-        # ewald_type: 'batched' | 'flat' | 'auto' | 'triton' | 'cheng'
+        # ewald_type: 'batched' | 'flat' | 'auto' | 'triton'
         self.ewald_type = ewald_type
-        self._native_ewald = ewald_type in (
-            'batched', 'flat', 'auto', 'triton'
-        )
         dl = les_args.get('dl', 2.0)
         sigma = les_args.get('sigma', 1.0)
         rsi = les_args.get('remove_self_interaction', True)
@@ -198,18 +185,17 @@ class LatentEwaldSum(nn.Module):
             self.ewald = TritonEwald(
                 dl=dl, sigma=sigma, remove_self_interaction=rsi
             )
-        elif ewald_type == 'cheng':
-            try:
-                from les import Les  # https://github.com/ChengUCB/les
-            except ImportError as e:
-                raise ImportError(
-                    "The 'les' package is required for ewald_type='cheng'. "
-                    "Install it"
-                    "or use ewald_type='batched'/'hybrid' for the native kernel"
-                ) from e
-            self.les = Les(les_args)
         else:
             raise ValueError(f'Unknown ewald_type: {ewald_type}')
+        # open-boundary (non-pbc) counterpart
+        if ewald_type == 'triton':
+            from .ewald import TritonDirectSum
+            self.direct = TritonDirectSum(
+                sigma=sigma, remove_self_interaction=rsi
+            )
+        else:
+            from .ewald import DirectSum
+            self.direct = DirectSum(sigma=sigma, remove_self_interaction=rsi)
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
@@ -223,34 +209,40 @@ class LatentEwaldSum(nn.Module):
             batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
             n_graphs = 1
 
-        # Batched cell: SevenNet stores (3,3) per graph; PyG stacks to (3*n,3).
-        # EdgePreprocess wrote the strained cell here, so les() receives a
-        # tensor connected to _strain for correct stress computation.
+        # per-graph (3,3) cells, PyG-stacked to (3n,3); strained by
+        # EdgePreprocess so stress flows through _strain
         if KEY.CELL in data:
             cell = data[KEY.CELL].view(-1, 3, 3)  # (n_graphs, 3, 3)
         else:
             cell = torch.zeros((n_graphs, 3, 3), device=pos.device, dtype=pos.dtype)
 
-        if self._native_ewald:
-            # Native batched reciprocal-space sum (no per-structure loop).
-            e_lr = self.ewald(q=q, r=pos, cell=cell, batch=batch)  # (n_graphs,)
+        # reciprocal sum for periodic graphs, direct sum for open (det ~ 0)
+        is_pbc = torch.linalg.det(cell).abs() > 1e-6           # (n_graphs,)
+        if bool(is_pbc.all()):
+            e_lr = self.ewald(q=q, r=pos, cell=cell, batch=batch)
+        elif not bool(is_pbc.any()):
+            e_lr = self.direct(q=q, r=pos, batch=batch, n_graphs=n_graphs)
         else:
-            les_result = self.les(
-                latent_charges=q,
-                positions=pos,
-                batch=batch,
-                cell=cell,
-                compute_energy=True,
-                compute_bec=self.compute_bec,
-                bec_output_index=self.bec_output_index,
+            atom_pbc = is_pbc[batch]
+            remap_p = torch.cumsum(is_pbc.long(), 0) - 1
+            remap_o = torch.cumsum((~is_pbc).long(), 0) - 1
+            e_p = self.ewald(
+                q=q[atom_pbc],
+                r=pos[atom_pbc],
+                cell=cell[is_pbc],
+                batch=remap_p[batch[atom_pbc]],
             )
-            e_lr = les_result['E_lr']  # (n_graphs,)
-            if self.compute_bec:
-                bec = les_result.get('BEC')
-                if bec is not None:
-                    data[KEY.LES_BEC] = bec
-
-        assert e_lr is not None
+            e_o = self.direct(
+                q=q[~atom_pbc],
+                r=pos[~atom_pbc],
+                batch=remap_o[batch[~atom_pbc]],
+                n_graphs=n_graphs - int(is_pbc.sum().item()),
+            )
+            e_lr = torch.zeros(
+                n_graphs, device=pos.device, dtype=pos.dtype
+            )
+            e_lr[is_pbc] = e_p
+            e_lr[~is_pbc] = e_o
 
         # Non-batch mode: squeeze to scalar to match SR_ENERGY from AtomReduce.
         data[self.key_output] = e_lr if self._is_batch_data else e_lr.squeeze()
@@ -510,7 +502,11 @@ class BornEffectiveCharge(nn.Module):
 
     def _polarization(self, q, r, cell, batch, n_graphs, factors):
         # Berry-phase-style polarization, vectorized over graphs.
-        # Returns P (n_graphs, 3) complex and per-atom phase (N, 3) complex.
+        # Returns lattice-resolved components p (G, 3) complex (Cartesian for
+        # open graphs), per-atom phase (N, 3), and the contraction matrix M
+        # with P_a = sum_e M_ea p_e (cell rows for pbc, identity for open).
+        # Phase correction is only valid per lattice direction, so BEC must
+        # be assembled from p and contracted with M afterwards.
         cdtype = torch.complex128 if r.dtype == torch.float64 else torch.complex64
         pbc = torch.linalg.det(cell).abs() >= 1e-6               # (G,)
         eye = torch.eye(3, device=r.device, dtype=r.dtype)
@@ -519,37 +515,29 @@ class BornEffectiveCharge(nn.Module):
         phase = torch.exp(1j * 2.0 * torch.pi * r_frac)          # (N, 3)
         S = torch.zeros(n_graphs, 3, device=r.device, dtype=cdtype)
         S.index_add_(0, batch, q * phase)
-        pol_pbc = (
-            torch.einsum('gab,gb->ga', safe_cell.to(cdtype), S)
-            / (1j * 2.0 * torch.pi)
-        )
-        pol_open = torch.zeros(n_graphs, 3, device=r.device, dtype=r.dtype)
-        pol_open.index_add_(0, batch, q * r)
-        P = torch.where(pbc.unsqueeze(1), pol_pbc, pol_open.to(cdtype))
+        p_pbc = S / (1j * 2.0 * torch.pi)                        # (G, 3) lattice
+        p_open = torch.zeros(n_graphs, 3, device=r.device, dtype=r.dtype)
+        p_open.index_add_(0, batch, q * r)                       # (G, 3) cartesian
+        p = torch.where(pbc.unsqueeze(1), p_pbc, p_open.to(cdtype))
         phase = torch.where(pbc[batch].unsqueeze(1), phase, torch.ones_like(phase))
-        return P * factors.unsqueeze(1), phase
+        M = torch.where(pbc.view(-1, 1, 1), cell, eye)           # (G, 3, 3)
+        return p * factors.unsqueeze(1), phase, M
 
-    def _bec_grad_batched(self, P, r, phase):
-        # All Cartesian x {real, imag} cotangents in one vmapped backward.
-        n_graphs = P.shape[0]
-        if P.dim() == 1:                                          # output_index set
-            Y = torch.stack([P.real, P.imag])                     # (2, G)
-        else:
-            Y = torch.stack([P.real, P.imag]).permute(0, 2, 1).reshape(6, n_graphs)
-        C = Y.shape[0]
-        cot = torch.eye(C, device=r.device, dtype=r.dtype)
-        cot = cot.unsqueeze(-1).expand(C, C, n_graphs)
+    def _bec_grad_batched(self, p, r, phase):
+        # All lattice-component x {real, imag} cotangents in one vmapped
+        # backward. Returns z (N, e, b), phase-corrected per lattice dir.
+        n_graphs = p.shape[0]
+        Y = torch.stack([p.real, p.imag]).permute(0, 2, 1).reshape(6, n_graphs)
+        cot = torch.eye(6, device=r.device, dtype=r.dtype)
+        cot = cot.unsqueeze(-1).expand(6, 6, n_graphs)
         (g,) = torch.autograd.grad(
             [Y], [r],
             grad_outputs=[cot],
             retain_graph=True,
             create_graph=self.training,
             is_grads_batched=True,
-        )                                                         # (C, N, 3)
-        if C == 2:
-            bec = g[0] + 1j * g[1]                                # (N, b)
-            return (bec * phase.conj().unsqueeze(1)).real
-        bec = (g[0:3] + 1j * g[3:6]).permute(1, 0, 2)             # (N, a, b)
+        )                                                         # (6, N, 3)
+        bec = (g[0:3] + 1j * g[3:6]).permute(1, 0, 2)             # (N, e, b)
         return (bec * phase.conj().unsqueeze(2)).real
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
@@ -617,22 +605,21 @@ class BornEffectiveCharge(nn.Module):
             cnt.index_add_(0, batch, torch.ones_like(q))
             q = q - (sum_q / cnt.clamp(min=1.0))[batch]
 
-        P, phases = self._polarization(q, r, cell, batch, n_graphs, factors)
-        if self.output_index is not None:
-            P = P[:, self.output_index]                   # (n_graphs,)
-            phases = phases[:, self.output_index]         # (N,)
+        p, phases, M = self._polarization(q, r, cell, batch, n_graphs, factors)
 
         if self.compute_dipole:
-            dip = P.real
+            dip = torch.einsum('gea,ge->ga', M.to(p.dtype), p).real
+            if self.output_index is not None:
+                dip = dip[:, self.output_index]           # (n_graphs,)
             data[self.data_key_dipole] = (
                 dip if self._is_batch_data else dip.squeeze(0)
             )
 
         if self.compute_bec:
-            result = None
+            z = None                                      # (N, e, b) per-lattice
             if self._use_batched_grad:
                 try:
-                    result = self._bec_grad_batched(P, r, phases)
+                    z = self._bec_grad_batched(p, r, phases)
                 except torch.OutOfMemoryError:
                     raise  # fallback loop uses MORE memory; do not mask OOM
                 except RuntimeError as e:
@@ -643,14 +630,14 @@ class BornEffectiveCharge(nn.Module):
                         'call e3nn.set_optimization_defaults(jit_script_fx='
                         'False) before building the model.'
                     )
-            if result is None:
-                if self.output_index is None:
-                    # grad -> (N, b, a); transpose so index1=P-comp a, index2=r-comp b
-                    bec = self._grad(P, r).transpose(1, 2).contiguous()   # (N, 3, 3)
-                    result = (bec * phases.unsqueeze(2).conj()).real
-                else:
-                    bec = self._grad(P, r)                                # (N, 3)
-                    result = (bec * phases.unsqueeze(1).conj()).real
+            if z is None:
+                # grad -> (N, b, e); transpose so index1=lattice e, index2=r-comp b
+                bec = self._grad(p, r).transpose(1, 2).contiguous()   # (N, 3, 3)
+                z = (bec * phases.unsqueeze(2).conj()).real
+            # Z*_ab = sum_e M_ea z_eb
+            result = torch.einsum('nea,neb->nab', M[batch], z)
+            if self.output_index is not None:
+                result = result[:, self.output_index]     # (N, 3)
             data[self.data_key_out] = result
 
         return data

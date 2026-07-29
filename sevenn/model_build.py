@@ -697,7 +697,7 @@ def build_E3_equivariant_model(
                 ),
                 # LR energy: Ewald summation on latent charges
                 'les_lr_energy': LatentEwaldSum(
-                    les_args=les_cfg.get('les_args', {'use_atomwise': False}),
+                    les_args=les_cfg.get('les_args', {}),
                     data_key_in=KEY.LES_Q,
                     data_key_out=KEY.LR_ENERGY,
                     ewald_type=les_cfg.get('ewald_type', 'batched'),

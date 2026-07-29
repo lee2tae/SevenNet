@@ -308,12 +308,251 @@ if _HAS_TRITON:
             w = (factors*kfac).unsqueeze(-1)
             pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
             pot.index_add_(0, kgraph.to(torch.long), w*S_sq)
-            volume = torch.linalg.det(cell)
+            volume = torch.linalg.det(cell).abs()
             pot = pot/volume.unsqueeze(1)
             if self.remove_self_interaction:
                 q_sq = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
                 q_sq.index_add_(0, batch, q**2)
                 pot = pot - q_sq/(self.sigma*(2*torch.pi)**1.5)
+            return (pot*self.norm_factor).sum(dim=1)
+
+
+    # ------------------- direct sum (open boundary) -------------------
+    # primitive: phi_i^c = sum_{j != i, graph(i)} q_j^c f(r_ij)
+    # f(r) = erf(a r)/r,  g = f'/r,  h = g'/r,  a = 1/(sqrt(2) sigma)
+    @triton.jit
+    def _ds_fwd(q, r, ba, aoff, na, phi, N, A: tl.constexpr, C0: tl.constexpr, NQ: tl.constexpr, B: tl.constexpr):
+        i = tl.program_id(0); ch = tl.program_id(1)
+        if i >= N:
+            return
+        g = tl.load(ba + i); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        rx = tl.load(r+i*3+0); ry = tl.load(r+i*3+1); rz = tl.load(r+i*3+2)
+        acc = tl.zeros((), dtype=phi.dtype.element_ty)
+        for jj in range(0, n, B):
+            o = jj + tl.arange(0, B); mk = o < n; idx = a0 + o
+            mk = mk & (idx != i)
+            jx = tl.load(r+idx*3+0, mask=mk, other=0.); jy = tl.load(r+idx*3+1, mask=mk, other=0.)
+            jz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            dx = rx-jx; dy = ry-jy; dz = rz-jz
+            rr = tl.maximum(tl.sqrt(dx*dx+dy*dy+dz*dz), 1e-10)
+            f = tl.erf(A*rr)/rr
+            qj = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+            acc += tl.sum(tl.where(mk, qj*f, acc*0))
+        tl.store(phi+i*NQ+ch, acc)
+
+
+    @triton.jit
+    def _ds_bwd_r(q, r, ba, aoff, na, dphi, dr_out, N, A: tl.constexpr, C0: tl.constexpr,
+                  NQ: tl.constexpr, B: tl.constexpr):
+        # dr_i = sum_{j != i} sum_c (dphi_i^c q_j^c + dphi_j^c q_i^c) g(r_ij) d_ij
+        i = tl.program_id(0)
+        if i >= N:
+            return
+        g = tl.load(ba + i); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        rx = tl.load(r+i*3+0); ry = tl.load(r+i*3+1); rz = tl.load(r+i*3+2)
+        z = tl.zeros((), dtype=dr_out.dtype.element_ty); ox = z; oy = z; oz = z
+        for jj in range(0, n, B):
+            o = jj + tl.arange(0, B); mk = o < n; idx = a0 + o
+            mk = mk & (idx != i)
+            jx = tl.load(r+idx*3+0, mask=mk, other=0.); jy = tl.load(r+idx*3+1, mask=mk, other=0.)
+            jz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            dx = rx-jx; dy = ry-jy; dz = rz-jz
+            rr = tl.maximum(tl.sqrt(dx*dx+dy*dy+dz*dz), 1e-10)
+            gg = C0*tl.exp(-A*A*rr*rr)/(rr*rr) - tl.erf(A*rr)/(rr*rr*rr)
+            w = tl.zeros_like(dx)
+            for ch in range(NQ):
+                di = tl.load(dphi+i*NQ+ch); qi = tl.load(q+i*NQ+ch)
+                dj = tl.load(dphi+idx*NQ+ch, mask=mk, other=0.)
+                qj = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+                w += di*qj + dj*qi
+            ox += tl.sum(tl.where(mk, w*gg*dx, z)); oy += tl.sum(tl.where(mk, w*gg*dy, z))
+            oz += tl.sum(tl.where(mk, w*gg*dz, z))
+        tl.store(dr_out+i*3+0, ox); tl.store(dr_out+i*3+1, oy); tl.store(dr_out+i*3+2, oz)
+
+
+    @triton.jit
+    def _ds_ddw_phi(q, r, ba, aoff, na, gdq, gdr, out, N, A: tl.constexpr, C0: tl.constexpr,
+                    NQ: tl.constexpr, B: tl.constexpr):
+        # gdphi_i^c = sum_{j != i} [gdq_j^c f_ij + q_j^c g_ij (gdr_i - gdr_j).d_ij]
+        i = tl.program_id(0); ch = tl.program_id(1)
+        if i >= N:
+            return
+        g = tl.load(ba + i); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        rx = tl.load(r+i*3+0); ry = tl.load(r+i*3+1); rz = tl.load(r+i*3+2)
+        gix = tl.load(gdr+i*3+0); giy = tl.load(gdr+i*3+1); giz = tl.load(gdr+i*3+2)
+        acc = tl.zeros((), dtype=out.dtype.element_ty)
+        for jj in range(0, n, B):
+            o = jj + tl.arange(0, B); mk = o < n; idx = a0 + o
+            mk = mk & (idx != i)
+            jx = tl.load(r+idx*3+0, mask=mk, other=0.); jy = tl.load(r+idx*3+1, mask=mk, other=0.)
+            jz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            gjx = tl.load(gdr+idx*3+0, mask=mk, other=0.); gjy = tl.load(gdr+idx*3+1, mask=mk, other=0.)
+            gjz = tl.load(gdr+idx*3+2, mask=mk, other=0.)
+            dx = rx-jx; dy = ry-jy; dz = rz-jz
+            rr = tl.maximum(tl.sqrt(dx*dx+dy*dy+dz*dz), 1e-10)
+            f = tl.erf(A*rr)/rr
+            gg = C0*tl.exp(-A*A*rr*rr)/(rr*rr) - tl.erf(A*rr)/(rr*rr*rr)
+            D = (gix-gjx)*dx + (giy-gjy)*dy + (giz-gjz)*dz
+            gq_j = tl.load(gdq+idx*NQ+ch, mask=mk, other=0.)
+            qj = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+            acc += tl.sum(tl.where(mk, gq_j*f + qj*gg*D, acc*0))
+        tl.store(out+i*NQ+ch, acc)
+
+
+    @triton.jit
+    def _ds_ddw_q(r, dphi, ba, aoff, na, gdr, out, N, A: tl.constexpr, C0: tl.constexpr,
+                  NQ: tl.constexpr, B: tl.constexpr):
+        # gq_i^c = sum_{j != i} dphi_j^c g_ij (gdr_i - gdr_j).d_ij
+        i = tl.program_id(0); ch = tl.program_id(1)
+        if i >= N:
+            return
+        g = tl.load(ba + i); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        rx = tl.load(r+i*3+0); ry = tl.load(r+i*3+1); rz = tl.load(r+i*3+2)
+        gix = tl.load(gdr+i*3+0); giy = tl.load(gdr+i*3+1); giz = tl.load(gdr+i*3+2)
+        acc = tl.zeros((), dtype=out.dtype.element_ty)
+        for jj in range(0, n, B):
+            o = jj + tl.arange(0, B); mk = o < n; idx = a0 + o
+            mk = mk & (idx != i)
+            jx = tl.load(r+idx*3+0, mask=mk, other=0.); jy = tl.load(r+idx*3+1, mask=mk, other=0.)
+            jz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            gjx = tl.load(gdr+idx*3+0, mask=mk, other=0.); gjy = tl.load(gdr+idx*3+1, mask=mk, other=0.)
+            gjz = tl.load(gdr+idx*3+2, mask=mk, other=0.)
+            dx = rx-jx; dy = ry-jy; dz = rz-jz
+            rr = tl.maximum(tl.sqrt(dx*dx+dy*dy+dz*dz), 1e-10)
+            gg = C0*tl.exp(-A*A*rr*rr)/(rr*rr) - tl.erf(A*rr)/(rr*rr*rr)
+            D = (gix-gjx)*dx + (giy-gjy)*dy + (giz-gjz)*dz
+            dj = tl.load(dphi+idx*NQ+ch, mask=mk, other=0.)
+            acc += tl.sum(tl.where(mk, dj*gg*D, acc*0))
+        tl.store(out+i*NQ+ch, acc)
+
+
+    @triton.jit
+    def _ds_ddw_r(q, r, dphi, ba, aoff, na, gdq, gdr, out, N, A: tl.constexpr, C0: tl.constexpr,
+                  NQ: tl.constexpr, B: tl.constexpr):
+        # gr_i = sum_{j != i} { a_ij g_ij d_ij
+        #        + w_ij [(gdr_i - gdr_j) g_ij + ((gdr_i - gdr_j).d_ij) h_ij d_ij] }
+        # a_ij = sum_c (dphi_i^c gdq_j^c + dphi_j^c gdq_i^c)
+        # w_ij = sum_c (dphi_i^c q_j^c + dphi_j^c q_i^c)
+        i = tl.program_id(0)
+        if i >= N:
+            return
+        g = tl.load(ba + i); a0 = tl.load(aoff + g); n = tl.load(na + g)
+        rx = tl.load(r+i*3+0); ry = tl.load(r+i*3+1); rz = tl.load(r+i*3+2)
+        gix = tl.load(gdr+i*3+0); giy = tl.load(gdr+i*3+1); giz = tl.load(gdr+i*3+2)
+        z = tl.zeros((), dtype=out.dtype.element_ty); ox = z; oy = z; oz = z
+        for jj in range(0, n, B):
+            o = jj + tl.arange(0, B); mk = o < n; idx = a0 + o
+            mk = mk & (idx != i)
+            jx = tl.load(r+idx*3+0, mask=mk, other=0.); jy = tl.load(r+idx*3+1, mask=mk, other=0.)
+            jz = tl.load(r+idx*3+2, mask=mk, other=0.)
+            gjx = tl.load(gdr+idx*3+0, mask=mk, other=0.); gjy = tl.load(gdr+idx*3+1, mask=mk, other=0.)
+            gjz = tl.load(gdr+idx*3+2, mask=mk, other=0.)
+            dx = rx-jx; dy = ry-jy; dz = rz-jz
+            rr = tl.maximum(tl.sqrt(dx*dx+dy*dy+dz*dz), 1e-10)
+            r2 = rr*rr
+            e = C0*tl.exp(-A*A*r2)
+            erf_ = tl.erf(A*rr)
+            gg = e/r2 - erf_/(r2*rr)
+            hh = -e*(2.0*A*A*r2 + 3.0)/(r2*r2) + 3.0*erf_/(r2*r2*rr)
+            aa = tl.zeros_like(dx); w = tl.zeros_like(dx)
+            for ch in range(NQ):
+                di = tl.load(dphi+i*NQ+ch); qi = tl.load(q+i*NQ+ch)
+                gqi = tl.load(gdq+i*NQ+ch)
+                dj = tl.load(dphi+idx*NQ+ch, mask=mk, other=0.)
+                qj = tl.load(q+idx*NQ+ch, mask=mk, other=0.)
+                gqj = tl.load(gdq+idx*NQ+ch, mask=mk, other=0.)
+                aa += di*gqj + dj*gqi
+                w += di*qj + dj*qi
+            ux = gix-gjx; uy = giy-gjy; uz = giz-gjz
+            D = ux*dx + uy*dy + uz*dz
+            cd = aa*gg + w*hh*D
+            ox += tl.sum(tl.where(mk, cd*dx + w*gg*ux, z))
+            oy += tl.sum(tl.where(mk, cd*dy + w*gg*uy, z))
+            oz += tl.sum(tl.where(mk, cd*dz + w*gg*uz, z))
+        tl.store(out+i*3+0, ox); tl.store(out+i*3+1, oy); tl.store(out+i*3+2, oz)
+
+
+    class _DSumBwd(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, dphi, q, r, ba, aoff, na, A, C0):
+            N, NQ = q.shape
+            dphi = dphi.contiguous()
+            dq = torch.zeros_like(q); dr = torch.zeros_like(r)
+            # f is symmetric: dq_j = sum_i dphi_i f_ij == fwd kernel on dphi
+            _ds_fwd[(N, NQ)](dphi, r, ba, aoff, na, dq, N, A, C0, NQ=NQ, B=BLK)
+            _ds_bwd_r[(N,)](q, r, ba, aoff, na, dphi, dr, N, A, C0, NQ=NQ, B=BLK)
+            ctx.save_for_backward(dphi, q, r, ba, aoff, na)
+            ctx.A = A; ctx.C0 = C0; ctx.NQ = NQ
+            return dq, dr
+
+        @staticmethod
+        def backward(ctx, gdq, gdr):
+            dphi, q, r, ba, aoff, na = ctx.saved_tensors
+            A = ctx.A; C0 = ctx.C0; NQ = ctx.NQ; N = q.shape[0]
+            gdq = gdq.contiguous(); gdr = gdr.contiguous()
+            gphi = torch.zeros_like(dphi)
+            gq = torch.zeros_like(q); gr = torch.zeros_like(r)
+            _ds_ddw_phi[(N, NQ)](q, r, ba, aoff, na, gdq, gdr, gphi, N, A, C0, NQ=NQ, B=BLK)
+            _ds_ddw_q[(N, NQ)](r, dphi, ba, aoff, na, gdr, gq, N, A, C0, NQ=NQ, B=BLK)
+            _ds_ddw_r[(N,)](q, r, dphi, ba, aoff, na, gdq, gdr, gr, N, A, C0, NQ=NQ, B=BLK)
+            return gphi, gq, gr, None, None, None, None, None
+
+
+    class _DSumFwd(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, r, ba, aoff, na, A, C0):
+            N, NQ = q.shape
+            phi = torch.zeros_like(q)
+            _ds_fwd[(N, NQ)](q, r, ba, aoff, na, phi, N, A, C0, NQ=NQ, B=BLK)
+            ctx.save_for_backward(q, r, ba, aoff, na)
+            ctx.A = A; ctx.C0 = C0
+            return phi
+
+        @staticmethod
+        def backward(ctx, dphi):
+            q, r, ba, aoff, na = ctx.saved_tensors
+            dq, dr = _DSumBwd.apply(dphi, q, r, ba, aoff, na, ctx.A, ctx.C0)
+            return dq, dr, None, None, None, None, None
+
+
+    class TritonDirectSum(torch.nn.Module):
+        """Triton counterpart of DirectSum; same convention and signature."""
+
+        def __init__(self, sigma=1.0, remove_self_interaction=True, norm_factor=90.4756):
+            super().__init__()
+            self.sigma = sigma
+            self.remove_self_interaction = remove_self_interaction
+            self.norm_factor = norm_factor
+            self.twopi = 2.0*torch.pi
+            self.alpha = 1.0/(sigma*2.0**0.5)
+            self.c0 = 2.0*self.alpha/torch.pi**0.5
+
+        def forward(self, q, r, batch=None, n_graphs=None):
+            if q.dim() == 1:
+                q = q.unsqueeze(1)
+            N = r.shape[0]
+            device, dtype = r.device, r.dtype
+            if batch is None:
+                batch = torch.zeros(N, dtype=torch.long, device=device)
+            if n_graphs is None:
+                n_graphs = int(batch.max().item()) + 1 if N > 0 else 0
+            n_q = q.shape[1]
+            if N == 0:
+                return torch.zeros(n_graphs, device=device, dtype=dtype)
+            na = torch.bincount(batch, minlength=n_graphs)
+            aoff = (torch.cumsum(na, 0)-na).to(torch.int32).contiguous()
+            na32 = na.to(torch.int32).contiguous()
+            ba = batch.to(torch.int32).contiguous()
+            phi = _DSumFwd.apply(
+                q.contiguous(), r.contiguous(), ba, aoff, na32, self.alpha, self.c0
+            )
+            pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+            pot.index_add_(0, batch, q*phi)
+            pot = pot/self.twopi/2.0
+            if not self.remove_self_interaction:
+                q_sq = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+                q_sq.index_add_(0, batch, q**2)
+                pot = pot + q_sq/(self.sigma*self.twopi**1.5)
             return (pot*self.norm_factor).sum(dim=1)
 
 
@@ -419,7 +658,7 @@ class BatchedEwald(nn.Module):
         k_sq_safe = torch.where(valid, k_sq, torch.ones_like(k_sq))   # avoid /0
         kfac = torch.exp(-self.sigma_sq_half * k_sq) / k_sq_safe      # [G,P']
         weight = factors.unsqueeze(0) * kfac * validf                # [G,P']
-        volume = torch.linalg.det(cell)                              # [G]  signed
+        volume = torch.linalg.det(cell).abs()                        # [G]
         pot = (weight.unsqueeze(1) * S_sq).sum(dim=2) / volume.unsqueeze(1)  # [G,n_q]
 
         # --- self-interaction removal (per charge channel) ---
@@ -537,13 +776,84 @@ class FlatBatchedEwald(nn.Module):
         weight = (factors_flat * kfac).unsqueeze(-1)              # [M,1]
         pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
         pot.index_add_(0, kgraph, weight * S_sq)                  # [G,n_q]
-        volume = torch.linalg.det(cell)
+        volume = torch.linalg.det(cell).abs()
         pot = pot / volume.unsqueeze(1)
 
         if self.remove_self_interaction:
             q_sq_tot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
             q_sq_tot.index_add_(0, batch, q ** 2)
             pot = pot - q_sq_tot / (self.sigma * (2 * torch.pi) ** 1.5)
+        return (pot * self.norm_factor).sum(dim=1)
+
+
+class DirectSum(nn.Module):
+    """
+    Open-boundary (non-pbc) screened Coulomb energy, batched over graphs.
+
+    E_g = (norm_factor / 4pi) * sum_{i != j in g} q_i q_j erf(r_ij / sqrt(2)s) / r_ij
+
+    The i != j sum has no self term: remove_self_interaction=True does
+    nothing, False adds it (reciprocal kernels subtract it when True).
+    """
+
+    def __init__(
+        self,
+        sigma: float = 1.0,
+        remove_self_interaction: bool = True,
+        norm_factor: float = 90.4756,
+    ):
+        super().__init__()
+        self.sigma = sigma
+        self.remove_self_interaction = remove_self_interaction
+        self.norm_factor = norm_factor
+        self.twopi = 2.0 * torch.pi
+
+    def forward(
+        self,
+        q: torch.Tensor,                       # [N, n_q] or [N]
+        r: torch.Tensor,                       # [N, 3]
+        batch: Optional[torch.Tensor] = None,  # [N]
+        n_graphs: Optional[int] = None,
+    ) -> torch.Tensor:                         # [n_graphs]
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        N = r.shape[0]
+        device, dtype = r.device, r.dtype
+        if batch is None:
+            batch = torch.zeros(N, dtype=torch.long, device=device)
+        if n_graphs is None:
+            n_graphs = int(batch.max().item()) + 1 if N > 0 else 0
+        n_q = q.shape[1]
+
+        # within-graph (i, j) pairs: atom i pairs with every atom of its graph
+        na = torch.bincount(batch, minlength=n_graphs)             # [G]
+        atom_off = torch.cumsum(na, 0) - na                        # [G]
+        counts = na[batch]                                         # [N]
+        base = torch.repeat_interleave(atom_off[batch], counts)    # [P]
+        block_off = torch.cumsum(counts, 0) - counts
+        local = torch.arange(base.shape[0], device=device) \
+            - torch.repeat_interleave(block_off, counts)
+        j_idx = base + local                                       # [P]
+        i_idx = torch.repeat_interleave(
+            torch.arange(N, device=device), counts
+        )                                                          # [P]
+        offdiag = i_idx != j_idx
+        i_idx = i_idx[offdiag]
+        j_idx = j_idx[offdiag]
+
+        # clamp matches the triton kernel; erf(ar)/r is finite as r -> 0
+        r_ij = torch.norm(r[i_idx] - r[j_idx], dim=-1).clamp(min=1e-10)
+        f = torch.special.erf(r_ij / (self.sigma * 2.0 ** 0.5)) / r_ij
+
+        e_pair = q[i_idx] * q[j_idx] * f.unsqueeze(-1)             # [P', n_q]
+        pot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+        pot.index_add_(0, batch[i_idx], e_pair)
+        pot = pot / self.twopi / 2.0
+
+        if not self.remove_self_interaction:
+            q_sq_tot = torch.zeros(n_graphs, n_q, device=device, dtype=dtype)
+            q_sq_tot.index_add_(0, batch, q ** 2)
+            pot = pot + q_sq_tot / (self.sigma * self.twopi ** 1.5)
         return (pot * self.norm_factor).sum(dim=1)
 
 

@@ -34,6 +34,8 @@ def _graph_build_matscipy(cutoff: float, pbc, cell, pos):
     pbc_y = pbc[1]
     pbc_z = pbc[2]
 
+    # copy: callers store the original cell (zeros for non-pbc) as KEY.CELL
+    cell = cell.copy()
     identity = np.identity(3, dtype=float)
     max_positions = np.max(np.absolute(pos)) + 1
 

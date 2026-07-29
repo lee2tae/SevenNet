@@ -111,7 +111,7 @@ def bec_joint_loader_from_config(
 
     if not config.get(KEY.IS_TRAIN_BEC, False):
         warnings.warn(
-            'load_becset_path is given but is_train_bec is False; '
+            'load_bec_trainset_path is given but is_train_bec is False; '
             'BEC references in the becset will not be trained on.'
         )
 
@@ -250,6 +250,12 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
         log.writeline('***************************************************')
         config[KEY.LOAD_TRAINSET] = config.pop(KEY.LOAD_DATASET)
 
+    if KEY.LOAD_BEC_TRAINSET not in config and config.get(KEY.LOAD_BECSET):
+        log.writeline(
+            'load_becset_path is deprecated, use load_bec_trainset_path'
+        )
+        config[KEY.LOAD_BEC_TRAINSET] = config.pop(KEY.LOAD_BECSET)
+
     # Initialize data progress for batch training
     train_by_batch = config.get(KEY.TRAIN_BY_BATCH, False)
 
@@ -288,7 +294,15 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
 
     # BEC-labeled second train stream: merged into trainset with homogeneous
     # batches instead of getting an eval-only loader like other load_*_path.
-    bec_dataset = datasets.pop('becset', None)
+    bec_dataset = datasets.pop('bec_trainset', None)
+    # BEC-labeled validset gets its own loader at bec_batch_size, so the
+    # BEC autograd never runs over a full batch_size validation batch.
+    if 'bec_validset' in datasets:
+        datasets['bec_validset'] = {
+            'dataset': datasets['bec_validset'],
+            'batch_size': config.get(KEY.BEC_BATCH_SIZE)
+            or config[KEY.BATCH_SIZE],
+        }
     loaders = {
         k: loader_from_config(config, v, dataset_key=k) for k, v in datasets.items()
     }

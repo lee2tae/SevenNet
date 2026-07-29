@@ -64,10 +64,10 @@ model:
         fukui_hidden_channels: [8]                # 'fukui' only: hidden widths of the Fukui-weight readout MLP. [] -> single IrrepsLinear.
         fukui_zero_init: False
 
-        epsilon_mode: learned                     # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom eps)
+        epsilon_mode: learned_atomic              # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom eps)
         epsilon_hidden_channels: [16]             # Hidden widths of the epsilon readout MLP. [] -> single IrrepsLinear.
         epsilon_min_one: True                     # Default. True (anti-screening prohibited)
-        remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'
+        remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'(only for learned_atomic)
 
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
 
@@ -129,6 +129,7 @@ data:
     use_modal_wise_scale: False
 
     dataset_type: 'graph'
-    load_trainset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_train.extxyz'
-    load_becset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_test.extxyz'
-    load_validset_path: '/home/lee2tae/SevenNet-LES/example_les/PBE/benchmark_both/dataset/both_joint_valid.extxyz'
+    load_trainset_path: 'path/to/trainset_without_BEC_labels'
+    load_bec_trainset_path: 'path/to/trainset_with_BEC_labels'
+    load_validset_path: 'path/to/validset_without_BEC_labels'
+    load_bec_validset_path: 'path/to/validset_with_BEC_labels'

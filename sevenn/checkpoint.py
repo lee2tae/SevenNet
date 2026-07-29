@@ -397,15 +397,16 @@ class SevenNetCheckpoint:
             zero weights, which preserves the SR baseline exactly at epoch 0
             but sets all charge gradients to zero — useful for verification
             tests, not for real training.
-          - ``les_lr_energy.les.*``: Les() default init
+          - ``les_lr_energy``: parameter-free (Ewald / direct-sum kernels)
 
         All other parameters are loaded from the checkpoint unchanged.
 
         Args:
             les_config: LES configuration dict forwarded to the model builder as
                 ``LES_CONFIG``.  Supported keys:
-                  les_args (dict)          — kwargs for ``Les()``,
-                                             default ``{'use_atomwise': False}``
+                  les_args (dict)          — Ewald kernel settings (dl, sigma,
+                                             remove_self_interaction),
+                                             default ``{}``
                   n_charges (int)          — number of latent charge channels
                                              per atom; the Ewald energy is the
                                              sum of n_charges independent
