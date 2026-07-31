@@ -311,6 +311,7 @@ DEFAULT_TRAINING_CONFIG = {
         ['TotalLoss', 'None'],
     ],
     KEY.BEST_METRIC: 'TotalLoss',
+    KEY.BEST_METRIC_LOADERS: None,  # None -> size-weighted *valid* loaders
     KEY.USE_WEIGHT: False,
     KEY.USE_MODALITY: False,
 }
@@ -345,6 +346,7 @@ TRAINING_CONFIG_CONDITION = {
     KEY.TRAIN_SHUFFLE: bool,
     KEY.ERROR_RECORD: error_record_condition,
     KEY.BEST_METRIC: str,
+    KEY.BEST_METRIC_LOADERS: lambda x: x is None or isinstance(x, (str, list, dict)),
     KEY.CSV_LOG: str,
     KEY.USE_MODALITY: bool,
     KEY.USE_WEIGHT: bool,

@@ -164,6 +164,8 @@ CSV_LOG = 'csv_log'
 
 ERROR_RECORD = 'error_record'
 BEST_METRIC = 'best_metric'
+# loader(s) whose metric drives checkpoint_best: str | list | {loader: weight}
+BEST_METRIC_LOADERS = 'best_metric_loaders'
 
 NUM_WORKERS = 'num_workers'  # not work
 

@@ -326,24 +326,59 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
         les_cfg = config.get(KEY.LES_CONFIG, {})
         zero_init = les_cfg.get('zero_init', False)
         freeze_sr = les_cfg.get('freeze_sr', False)
-        if zero_init and freeze_sr:
+        freeze_q = les_cfg.get('freeze_q', False)
+        if zero_init and (freeze_sr or freeze_q):
             raise ValueError(
-                'zero_init=True + freeze_sr=True is a no-op (q stuck at 0, '
-                'SR frozen). Set one of them to False.'
+                'zero_init=True + freeze_sr/freeze_q=True is a no-op (q stuck '
+                'at 0, rest frozen). Set one of them to False.'
             )
         if zero_init:
             log.writeline(
                 'WARNING: zero_init=True locks q=0 forever; the LR branch '
                 'will not train. Only SR weights move.'
             )
-        if freeze_sr:
-            les_module_names = {
+        # freeze_q is the stricter option and wins if both are set
+        if freeze_q:
+            # epsilon head only: SR, q and fukui readouts all fixed, so eps is
+            # fitted as a pure Z*/(q + flux) ratio and cannot distort the
+            # charges. Intended for staged E/F/S -> BEC training.
+            if les_cfg.get('epsilon_mode', 'fixed') not in (
+                'learned', 'learned_atomic'
+            ):
+                raise ValueError(
+                    'freeze_q=True requires epsilon_mode "learned" or '
+                    '"learned_atomic"; otherwise nothing would train.'
+                )
+            keep = {'les_epsilon_readout', 'les_epsilon_pool', 'les_bec'}
+            tag = 'freeze_q=True: epsilon head only'
+        elif freeze_sr:
+            # every LES-branch module stays trainable, including the epsilon
+            # head; without les_epsilon_readout here, staged E/F/S -> BEC
+            # training would freeze the very head it means to fit
+            keep = {
                 'les_charge_readout', 'les_lr_energy', 'les_fukui_readout',
+                'les_epsilon_readout', 'les_epsilon_pool', 'les_bec',
             }
+            tag = 'freeze_sr=True: SR parameters frozen'
+        else:
+            keep = None
+
+        if keep is not None:
+            trainable = []
             for name, param in model.named_parameters():
-                if name.split('.')[0] not in les_module_names:
+                if name.split('.')[0] not in keep:
                     param.requires_grad_(False)
-            log.writeline('LES fine-tuning: SR parameters frozen (freeze_sr=True).')
+                elif param.requires_grad:
+                    trainable.append(name.split('.')[0])
+            if not trainable:
+                raise ValueError(
+                    f'{tag}: no trainable parameters remain. Check that the '
+                    'requested LES modules exist in this model.'
+                )
+            log.writeline(
+                f'LES fine-tuning: {tag}. '
+                f'Trainable modules: {sorted(set(trainable))}'
+            )
 
     trainer = Trainer.from_config(model, config)
     if state_dicts:

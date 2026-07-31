@@ -66,14 +66,37 @@ def processing_by_batch(
     recorders = {k: deepcopy(recorder) for k in loaders}
 
     best_val = float('inf')
-    best_key = None
-    if best_metric_loader_key in recorders:
-        best_key = recorders[best_metric_loader_key].get_key_str(best_metric)
-    if best_key is None:
+    # checkpoint_best criterion: weighted sum of best_metric over loaders.
+    # Default: every *valid* loader, weighted by its frame count (equivalent
+    # to the old single joint validset). best_metric_loaders overrides.
+    best_loaders = config.get(KEY.BEST_METRIC_LOADERS, None)
+    if best_loaders is None:
+        sizes = {
+            k: len(ldr.dataset) for k, ldr in loaders.items()
+            if k != train_loader_key and 'valid' in k
+        }
+        total = sum(sizes.values())
+        best_loaders = {k: s / total for k, s in sizes.items()} if total else {}
+    elif isinstance(best_loaders, str):
+        best_loaders = {best_loaders: 1.0}
+    elif isinstance(best_loaders, (list, tuple)):
+        best_loaders = {k: 1.0 for k in best_loaders}
+    best_keys = {
+        lk: recorders[lk].get_key_str(best_metric)
+        for lk in best_loaders
+        if lk in recorders and recorders[lk].get_key_str(best_metric)
+    }
+    if not best_keys:
         log.writeline(
             f'Failed to get error recorder key: {best_metric} or '
-            + f'{best_metric_loader_key} is missing. There will be no best '
+            + f'{list(best_loaders)} is missing. There will be no best '
             + 'checkpoint.'
+        )
+    else:
+        log.writeline(
+            'checkpoint_best criterion: '
+            + ' + '.join(f'{best_loaders[lk]:.4g}*{lk}_{best_metric}'
+                         for lk in best_keys)
         )
 
     csv_path = unique_filepath(f'{prefix}/lc.csv')
@@ -248,12 +271,18 @@ def processing_by_batch(
                         with open(csv_path, 'a') as f:
                             f.write(','.join(list(csv_dct.values())) + '\n')
 
-                    if best_key and errors[best_metric_loader_key][best_key] < best_val:
-                        trainer.write_checkpoint(
-                            f'{prefix}/checkpoint_best.pth', config=config, epoch=epoch
+                    if best_keys:
+                        val = sum(
+                            best_loaders[lk] * errors[lk][bk]
+                            for lk, bk in best_keys.items()
                         )
-                        best_val = errors[best_metric_loader_key][best_key]
-                        log.writeline('Best checkpoint written')
+                        if val < best_val:
+                            trainer.write_checkpoint(
+                                f'{prefix}/checkpoint_best.pth',
+                                config=config, epoch=epoch,
+                            )
+                            best_val = val
+                            log.writeline('Best checkpoint written')
 
                     log.timer_end(
                         'batch', message=f'Batch {current_batch_idx} elapsed'

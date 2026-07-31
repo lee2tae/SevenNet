@@ -70,6 +70,11 @@ model:
         remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'(only for learned_atomic)
 
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
+                                                  # True -> freeze SR; train the LES branch (q, fukui, epsilon).
+        freeze_q: False                            # Default: False. True -> train ONLY the epsilon head (SR, q and
+                                                  # fukui frozen), so eps is a pure Z*/(q+flux) ratio and cannot
+                                                  # distort charges. For staged E/F/S -> BEC training. Needs
+                                                  # epsilon_mode learned/learned_atomic. Overrides freeze_sr.
 
 train:
     train_shuffle: True
