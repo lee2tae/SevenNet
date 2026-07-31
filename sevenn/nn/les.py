@@ -209,12 +209,14 @@ class LatentEwaldSum(nn.Module):
             batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
             n_graphs = 1
 
-        # per-graph (3,3) cells, PyG-stacked to (3n,3); strained by
-        # EdgePreprocess so stress flows through _strain
-        if KEY.CELL in data:
-            cell = data[KEY.CELL].view(-1, 3, 3)  # (n_graphs, 3, 3)
-        else:
-            cell = torch.zeros((n_graphs, 3, 3), device=pos.device, dtype=pos.dtype)
+        # per-graph (3,3) cells, PyG-stacked to (3n,3)
+        # EdgePreprocess requires KEY.CELL (which is the first layer of LES modules)
+        # So this RuntimeError should never happen if the model is built correctly, but we check anyway.
+        if KEY.CELL not in data:
+            raise RuntimeError(
+                f'{KEY.CELL} missing from graph data; LES requires it.'
+            )
+        cell = data[KEY.CELL].view(-1, 3, 3)  # (n_graphs, 3, 3)
 
         # reciprocal sum for periodic graphs, direct sum for open (det ~ 0)
         is_pbc = torch.linalg.det(cell).abs() > 1e-6           # (n_graphs,)
@@ -571,10 +573,13 @@ class BornEffectiveCharge(nn.Module):
             batch = torch.zeros(r.shape[0], dtype=torch.long, device=r.device)
             n_graphs = 1
 
-        if self.data_key_cell in data:
-            cell = data[self.data_key_cell].view(-1, 3, 3)
-        else:
-            cell = torch.zeros((n_graphs, 3, 3), device=r.device, dtype=r.dtype)
+        # redundant like the one in LatentEwaldSum; kept for the message
+        if self.data_key_cell not in data:
+            raise RuntimeError(
+                f'{self.data_key_cell} missing from graph data; LES BEC '
+                'requires it. Build graphs with with_shift=True.'
+            )
+        cell = data[self.data_key_cell].view(-1, 3, 3)
 
         if self.epsilon_mode == 'learned_atomic':
             # scale BEFORE neutralize so the acoustic sum rule survives

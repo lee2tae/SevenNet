@@ -101,6 +101,15 @@ def _correct_scalar(v):
         assert False, f'{type(v)} is not expected'
 
 
+def _pbc_masked_cell(cell: np.ndarray, pbc) -> np.ndarray:
+    """
+    [LES]: Zero the lattice vectors of non-periodic directions.
+    """
+    cell = cell.copy()
+    cell[~np.asarray(pbc, dtype=bool)] = 0.0
+    return cell
+
+
 def unlabeled_atoms_to_graph(
     atoms: ase.Atoms, cutoff: float, with_shift: bool = False
 ):
@@ -126,7 +135,7 @@ def unlabeled_atoms_to_graph(
 
     if with_shift:
         data[KEY.CELL_SHIFT] = shift
-        data[KEY.CELL] = cell
+        data[KEY.CELL] = _pbc_masked_cell(cell, pbc)
     data[KEY.INFO] = {}
     return data
 
@@ -210,7 +219,7 @@ def atoms_to_graph(
 
     if with_shift:
         data[KEY.CELL_SHIFT] = shift
-        data[KEY.CELL] = cell
+        data[KEY.CELL] = _pbc_masked_cell(cell, pbc)
 
     if 'bec_dft' in atoms.arrays:
         data[KEY.LES_BEC_REF] = atoms.arrays['bec_dft'].reshape(
