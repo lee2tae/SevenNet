@@ -138,8 +138,21 @@ class LatentEwaldSum(nn.Module):
     ForceStressOutput then differentiates w.r.t. strained pos (forces) and
     _strain (complete stress: SR virial + LR positional + LR cell/k-space).
 
+    2D (slab) systems are recognized by the zero-row cell convention set by
+    dataload._pbc_masked_cell: exactly one zero lattice vector and two
+    independent nonzero ones. They are handled with EW3DC (Yeh-Berkowitz):
+    the zero row is replaced on the fly by a vacuum-padded axis along the
+    slab normal, the regular 3D Ewald kernel runs on that cell, and the
+    analytic slab-dipole correction  E_c = norm_factor * M_n^2 / V  is added
+    (M_n = sum_i q_i r_i.n_hat, per charge channel). The residual error
+    decays as exp(-2*pi*gap/L_inplane), so the padding scales with the
+    in-plane cell length.
+
     Args:
-        les_args:     dl / sigma / remove_self_interaction settings.
+        les_args:     dl / sigma / remove_self_interaction settings, plus
+                      slab_vacuum_factor (vacuum gap in units of the largest
+                      in-plane cell length, default 1.5) and slab_min_pad
+                      (minimum gap in Angstrom, default 8 * sigma).
         data_key_in:  per-atom latent charges (N_atoms, n_charges).
         data_key_out: per-graph LR energy output.
     """
@@ -161,6 +174,8 @@ class LatentEwaldSum(nn.Module):
         dl = les_args.get('dl', 2.0)
         sigma = les_args.get('sigma', 1.0)
         rsi = les_args.get('remove_self_interaction', True)
+        self.slab_vacuum_factor = les_args.get('slab_vacuum_factor', 1.5)
+        self.slab_min_pad = les_args.get('slab_min_pad', 8.0 * sigma)
         if ewald_type == 'batched':
             from .ewald import BatchedEwald
             self.ewald = BatchedEwald(dl=dl, sigma=sigma, remove_self_interaction=rsi)
@@ -198,9 +213,72 @@ class LatentEwaldSum(nn.Module):
             self.direct = DirectSum(sigma=sigma, remove_self_interaction=rsi)
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
+    def _extend_slab_cells(self, q, pos, cell, batch, n_graphs):
+        """
+        EW3DC for slab graphs (exactly one zero cell row).
+        Returns Yeh-Berkowitz dipole correction per graph or None
+        """
+        with torch.no_grad():
+            row_norm = torch.linalg.norm(cell, dim=2)               # (G, 3)
+            cand = ((row_norm > 1e-6).sum(dim=1) == 2) & (
+                torch.linalg.det(cell).abs() <= 1e-6
+            )
+            if not bool(cand.any()):
+                return cell, None
+            i0 = torch.argmin(row_norm, dim=1)                      # zero row
+
+        g = torch.arange(n_graphs, device=cell.device)
+        a_j = cell[g, (i0 + 1) % 3]
+        a_k = cell[g, (i0 + 2) % 3]
+        nvec = torch.linalg.cross(a_j, a_k)                         # (G, 3)
+        with torch.no_grad():
+            is_2d = cand & (torch.linalg.norm(nvec, dim=1) > 1e-6)
+            if not bool(is_2d.any()):
+                return cell, None
+        # unit fallback keeps norm/div grads NaN-free on non-slab graphs
+        ez = torch.zeros_like(nvec)
+        ez[:, 2] = 1.0
+        nvec = torch.where(is_2d.unsqueeze(1), nvec, ez)
+        n_hat = nvec / torch.linalg.norm(nvec, dim=1, keepdim=True)
+
+        z = (pos * n_hat[batch]).sum(dim=1)                         # (N,)
+        with torch.no_grad():
+            fmax = torch.finfo(z.dtype).max
+            zmax = torch.full(
+                (n_graphs,), -fmax, device=z.device, dtype=z.dtype
+            ).scatter_reduce(0, batch, z, 'amax')
+            zmin = torch.full(
+                (n_graphs,), fmax, device=z.device, dtype=z.dtype
+            ).scatter_reduce(0, batch, z, 'amin')
+            pad = (
+                self.slab_vacuum_factor * row_norm.max(dim=1).values
+            ).clamp(min=self.slab_min_pad)
+            lz = (zmax - zmin).clamp(min=0.0) + pad                 # (G,)
+
+        row_sel = torch.nn.functional.one_hot(i0, 3).bool()         # (G, 3)
+        mask = (is_2d.unsqueeze(1) & row_sel).unsqueeze(2)          # (G, 3, 1)
+        new_row = (lz.unsqueeze(1) * n_hat).unsqueeze(1)            # (G, 1, 3)
+        cell = torch.where(mask, new_row, cell)
+
+        # M_n from mean-centered normal coordinates (origin-independent)
+        cnt = torch.zeros(n_graphs, device=z.device, dtype=z.dtype)
+        cnt.scatter_add_(0, batch, torch.ones_like(z))
+        zsum = torch.zeros(n_graphs, device=z.device, dtype=z.dtype)
+        zsum.scatter_add_(0, batch, z)
+        zc = z - (zsum / cnt.clamp(min=1.0))[batch]
+        mn = torch.zeros(n_graphs, q.shape[1], device=z.device, dtype=z.dtype)
+        mn.index_add_(0, batch, q * zc.unsqueeze(1))                # (G, n_q)
+        vol = torch.linalg.det(cell).abs()
+        vol = torch.where(is_2d, vol, torch.ones_like(vol))
+        e_corr = self.ewald.norm_factor * (mn ** 2).sum(dim=1) / vol
+        e_corr = torch.where(is_2d, e_corr, torch.zeros_like(e_corr))
+        return cell, e_corr
+
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         q = data[self.key_input]   # (N_atoms, n_charges)
         pos = data[KEY.POS]        # strained pos from EdgePreprocess
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
 
         if self._is_batch_data:
             batch = data[KEY.BATCH].long()
@@ -217,6 +295,9 @@ class LatentEwaldSum(nn.Module):
                 f'{KEY.CELL} missing from graph data; LES requires it.'
             )
         cell = data[KEY.CELL].view(-1, 3, 3)  # (n_graphs, 3, 3)
+
+        # slab (2D) graphs: vacuum-pad the cell + Yeh-Berkowitz correction
+        cell, e_slab = self._extend_slab_cells(q, pos, cell, batch, n_graphs)
 
         # reciprocal sum for periodic graphs, direct sum for open (det ~ 0)
         is_pbc = torch.linalg.det(cell).abs() > 1e-6           # (n_graphs,)
@@ -245,6 +326,9 @@ class LatentEwaldSum(nn.Module):
             )
             e_lr[is_pbc] = e_p
             e_lr[~is_pbc] = e_o
+
+        if e_slab is not None:
+            e_lr = e_lr + e_slab
 
         # Non-batch mode: squeeze to scalar to match SR_ENERGY from AtomReduce.
         data[self.key_output] = e_lr if self._is_batch_data else e_lr.squeeze()
@@ -504,25 +588,47 @@ class BornEffectiveCharge(nn.Module):
 
     def _polarization(self, q, r, cell, batch, n_graphs, factors):
         # Berry-phase-style polarization, vectorized over graphs.
-        # Returns lattice-resolved components p (G, 3) complex (Cartesian for
-        # open graphs), per-atom phase (N, 3), and the contraction matrix M
-        # with P_a = sum_e M_ea p_e (cell rows for pbc, identity for open).
-        # Phase correction is only valid per lattice direction, so BEC must
-        # be assembled from p and contracted with M afterwards.
         cdtype = torch.complex128 if r.dtype == torch.float64 else torch.complex64
-        pbc = torch.linalg.det(cell).abs() >= 1e-6               # (G,)
         eye = torch.eye(3, device=r.device, dtype=r.dtype)
-        safe_cell = torch.where(pbc.view(-1, 1, 1), cell, eye)
+        with torch.no_grad():
+            row_norm = torch.linalg.norm(cell, dim=2)            # (G, 3)
+            row_nz = row_norm > 1e-6
+            pbc3 = torch.linalg.det(cell).abs() >= 1e-6          # (G,)
+            cand = (row_nz.sum(dim=1) == 2) & ~pbc3
+            i0 = torch.argmin(row_norm, dim=1)                   # zero row
+        g = torch.arange(n_graphs, device=r.device)
+        a_j = cell[g, (i0 + 1) % 3]
+        a_k = cell[g, (i0 + 2) % 3]
+        nvec = torch.linalg.cross(a_j, a_k)                      # (G, 3)
+        with torch.no_grad():
+            is_2d = cand & (torch.linalg.norm(nvec, dim=1) > 1e-6)
+        ez = torch.zeros_like(nvec)
+        ez[:, 2] = 1.0
+        nvec = torch.where(is_2d.unsqueeze(1), nvec, ez)
+        n_hat = nvec / torch.linalg.norm(nvec, dim=1, keepdim=True)
+
+        # per-direction Berry mask and invertible cell
+        dmask = torch.where(
+            is_2d.unsqueeze(1), row_nz, pbc3.unsqueeze(1).expand(-1, 3)
+        )                                                        # (G, 3)
+        row_sel = torch.nn.functional.one_hot(i0, 3).bool()      # (G, 3)
+        safe_cell = torch.where(pbc3.view(-1, 1, 1), cell, eye)
+        slab_cell = torch.where(
+            (is_2d.unsqueeze(1) & row_sel).unsqueeze(2),
+            n_hat.unsqueeze(1), cell,
+        )
+        safe_cell = torch.where(is_2d.view(-1, 1, 1), slab_cell, safe_cell)
+
         r_frac = torch.einsum('nd,nde->ne', r, torch.linalg.inv(safe_cell)[batch])
         phase = torch.exp(1j * 2.0 * torch.pi * r_frac)          # (N, 3)
+        phase = torch.where(dmask[batch], phase, torch.ones_like(phase))
         S = torch.zeros(n_graphs, 3, device=r.device, dtype=cdtype)
         S.index_add_(0, batch, q * phase)
         p_pbc = S / (1j * 2.0 * torch.pi)                        # (G, 3) lattice
         p_open = torch.zeros(n_graphs, 3, device=r.device, dtype=r.dtype)
-        p_open.index_add_(0, batch, q * r)                       # (G, 3) cartesian
-        p = torch.where(pbc.unsqueeze(1), p_pbc, p_open.to(cdtype))
-        phase = torch.where(pbc[batch].unsqueeze(1), phase, torch.ones_like(phase))
-        M = torch.where(pbc.view(-1, 1, 1), cell, eye)           # (G, 3, 3)
+        p_open.index_add_(0, batch, q * r_frac)                  # (G, 3) cartesian
+        p = torch.where(dmask, p_pbc, p_open.to(cdtype))
+        M = safe_cell                                            # (G, 3, 3)
         return p * factors.unsqueeze(1), phase, M
 
     def _bec_grad_batched(self, p, r, phase):
