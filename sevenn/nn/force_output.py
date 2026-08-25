@@ -55,7 +55,7 @@ class ForceOutput(nn.Module):
 class ForceStressOutput(nn.Module):
     """
     Compute stress and force from positions.
-    Used in serial torchscipt models
+    Used in les model.
     """
     def __init__(
         self,
@@ -105,7 +105,7 @@ class ForceStressOutput(nn.Module):
         if self._is_batch_data:
             volume[volume < vlim] = vlim
         elif volume < vlim:
-            volume = torch.tensor(vlim)
+            volume = torch.full_like(volume, vlim)
 
         if sgrad is not None:
             if self._is_batch_data:

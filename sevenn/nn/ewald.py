@@ -602,7 +602,7 @@ class BatchedEwald(nn.Module):
         a1 = torch.arange(-int(Nk_max[1]), int(Nk_max[1]) + 1, device=device)
         a2 = torch.arange(-int(Nk_max[2]), int(Nk_max[2]) + 1, device=device)
         nvec = torch.stack(
-            torch.meshgrid(a0, a1, a2, indexing='ij'), dim=-1
+            torch.meshgrid([a0, a1, a2], indexing='ij'), dim=-1
         ).reshape(-1, 3).to(dtype)                         # [P,3]
         P = nvec.shape[0]
 

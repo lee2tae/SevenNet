@@ -421,8 +421,8 @@ class SevenNetCheckpoint:
                                              default ``False``
                   bec_output_index (int)   — 0/1/2 for BEC component,
                                              default ``None``
-                  epsilon_mode (str)       — 'fixed' | 'learned' BEC epsilon
-                                             factor, default ``'fixed'``
+                  epsilon_mode (str)       — 'fixed' | 'learned' | 'learned_atomic',
+                                             default ``'fixed'``
                   epsilon_hidden_channels  — hidden widths for the epsilon
                                              head MLP, default ``None``
             freeze_sr: if ``True`` (default), set ``requires_grad=False`` on

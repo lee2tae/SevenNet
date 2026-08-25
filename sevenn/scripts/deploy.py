@@ -24,6 +24,13 @@ def deploy(
         warn_no_tp_accelerator('LAMMPS TorchScript deployment')
 
     cp = load_checkpoint(checkpoint)
+    use_les = cp.config.get(KEY.USE_LES, False)
+    if use_les:
+        # Triton Ewald kernels are not TorchScript-able; 'batched' is the
+        # reference implementation they were validated against. Deploy-time
+        # override only (parameter-free swap, state dict unaffected).
+        cp._config.setdefault(KEY.LES_CONFIG, {})['ewald_type'] = 'batched'
+
     model, config = (
         cp.build_model(
             enable_cueq=False,
@@ -34,7 +41,19 @@ def deploy(
         cp.config,
     )
 
-    if 'force_output' in model._modules:
+    if use_les:
+        # LES models keep force_output: pair_e3gnn_les reads forces/stress
+        # from the model (EdgePreprocess pos/_strain graph) instead of
+        # differentiating w.r.t. edge vectors. Analysis-only heads (BEC,
+        # epsilon) are dropped; they are irrelevant for MD and some are not
+        # scriptable (complex autograd).
+        for key in (
+            'les_bec',
+            'les_epsilon_readout',
+            'les_epsilon_pool',
+        ):
+            model.delete_module_by_key(key)
+    elif 'force_output' in model._modules:
         model.delete_module_by_key('force_output')
     if hasattr(model, 'eval_type_map'):
         setattr(model, 'eval_type_map', False)
@@ -64,6 +83,7 @@ def deploy(
     md_configs.update({'num_species': str(config[KEY.NUM_SPECIES])})
     md_configs.update({'flashTP': 'yes' if use_flash else 'no'})
     md_configs.update({'oeq': 'yes' if use_oeq else 'no'})
+    md_configs.update({'les': 'yes' if use_les else 'no'})
     md_configs.update(
         {'model_type': config.pop(KEY.MODEL_TYPE, 'E3_equivariant_model')}
     )
@@ -93,6 +113,12 @@ def deploy_parallel(
     GHOST_LAYERS_KEYS = ['onehot_to_feature_x', '0_self_interaction_1']
 
     cp = load_checkpoint(checkpoint)
+    if cp.config.get(KEY.USE_LES, False):
+        raise NotImplementedError(
+            'LES models cannot be deployed for the parallel pair style: the '
+            'Ewald sum needs the whole cell on one rank. Use sevenn deploy '
+            '(serial) with pair_style e3gnn/les on a single MPI rank.'
+        )
 
     model, config = (
         cp.build_model(

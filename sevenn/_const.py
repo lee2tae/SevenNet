@@ -145,8 +145,6 @@ DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG = {
     KEY.CUEQUIVARIANCE_CONFIG: {},
     KEY.USE_OEQ: False,
     KEY.USE_LES: False,
-    # les_config keys: les_args (dict), compute_bec (bool), bec_output_index
-    # (int|None), epsilon_mode ('fixed'|'learned'), epsilon_hidden_channels
     KEY.LES_CONFIG: {},
 }
 

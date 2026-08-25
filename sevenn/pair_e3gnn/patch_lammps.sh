@@ -119,8 +119,8 @@ cp $lammps_root/cmake/CMakeLists.txt $backup_dir/CMakeLists.txt
 ###########################################
 
 # 1. Copy pair_e3gnn files to LAMMPS source
-cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel,comm_brick}.cpp $lammps_root/src/
-cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel,comm_brick}.h $lammps_root/src/
+cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_les,pair_e3gnn_parallel,comm_brick}.cpp $lammps_root/src/
+cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_les,pair_e3gnn_parallel,comm_brick}.h $lammps_root/src/
 # Always copy the oEq autograd bridge (pair_e3gnn.cpp has an extern reference to it)
 cp $SCRIPT_DIR/pair_e3gnn_oeq_autograd.cpp $lammps_root/src/  # TODO: set this as oeq-specific
 

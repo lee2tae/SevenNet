@@ -1,6 +1,5 @@
 import copy
 import os.path
-import warnings
 from functools import partial
 from itertools import chain, islice
 from typing import Callable, Dict, List, Optional
@@ -106,16 +105,11 @@ def _pbc_masked_cell(cell: np.ndarray, pbc) -> np.ndarray:
     """
     [LES]: Zero the lattice vectors of non-periodic directions.
     The zero-row pattern is the routing signal for LatentEwaldSum:
-    3 nonzero rows -> 3D Ewald, exactly 2 -> slab (EW3DC), else -> DirectSum.
+    3 nonzero rows -> 3D Ewald, exactly 2 -> slab (EW3DC),
+    exactly 1 -> wire (1D Ewald), 0 -> DirectSum.
     """
     cell = cell.copy()
     pbc = np.asarray(pbc, dtype=bool)
-    if pbc.sum() == 1:
-        warnings.warn(
-            '1D-periodic structure found; LES does not support 1D Ewald '
-            'and treats it as open-boundary (0D).',
-            stacklevel=2,
-        )
     cell[~pbc] = 0.0
     return cell
 

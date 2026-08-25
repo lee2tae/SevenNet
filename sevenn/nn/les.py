@@ -25,7 +25,7 @@ References:
   - NequIP-LES:  https://github.com/ChengUCB/nequip-les
 """
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -80,6 +80,7 @@ class LatentChargeReadout(nn.Module):
         if hidden_channels is None:
             hidden_channels = []
         self._hidden_channels = list(hidden_channels)
+        self._has_hidden = len(self._hidden_channels) > 0
 
         first_out = hidden_channels[0] if hidden_channels else n_charges
         # Intermediate key only needed when a scalar MLP follows.
@@ -121,7 +122,7 @@ class LatentChargeReadout(nn.Module):
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
         data = self.first_linear(data)
-        if self._hidden_channels:
+        if self._has_hidden:
             data[self.key_output] = self.scalar_mlp(data[self._intermediate_key])
         return data
 
@@ -148,11 +149,20 @@ class LatentEwaldSum(nn.Module):
     decays as exp(-2*pi*gap/L_inplane), so the padding scales with the
     in-plane cell length.
 
+    1D (wire) systems -- exactly one nonzero lattice vector -- are handled
+    by the exact 1D Ewald of the smeared kernel (Ewald1DSum in ewald_1d.py):
+    Poisson summation along the periodic axis, continuum transverse modes.
+    Vacuum padding is NOT used for wires: its error decays only
+    algebraically in the padding (unlike the slab case).
+
     Args:
         les_args:     dl / sigma / remove_self_interaction settings, plus
                       slab_vacuum_factor (vacuum gap in units of the largest
-                      in-plane cell length, default 1.5) and slab_min_pad
-                      (minimum gap in Angstrom, default 8 * sigma).
+                      in-plane cell length, default 1.5), slab_min_pad
+                      (minimum gap in Angstrom, default 8 * sigma),
+                      ewald_1d_tol (1D mode-cutoff/quadrature tolerance,
+                      default 1e-7) and ewald_1d_nodes (1D quadrature
+                      nodes, default 32).
         data_key_in:  per-atom latent charges (N_atoms, n_charges).
         data_key_out: per-graph LR energy output.
     """
@@ -211,30 +221,53 @@ class LatentEwaldSum(nn.Module):
         else:
             from .ewald import DirectSum
             self.direct = DirectSum(sigma=sigma, remove_self_interaction=rsi)
+        # 1D-periodic (wire) counterpart
+        tol_1d = les_args.get('ewald_1d_tol', 1e-7)
+        nodes_1d = les_args.get('ewald_1d_nodes', 32)
+        if ewald_type == 'triton':
+            from .ewald_1d import TritonEwald1DSum
+            self.ewald_1d = TritonEwald1DSum(
+                sigma=sigma, remove_self_interaction=rsi,
+                tol=tol_1d, n_nodes=nodes_1d,
+            )
+        else:
+            from .ewald_1d import Ewald1DSum
+            self.ewald_1d = Ewald1DSum(
+                sigma=sigma, remove_self_interaction=rsi,
+                tol=tol_1d, n_nodes=nodes_1d,
+            )
         self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data()
 
-    def _extend_slab_cells(self, q, pos, cell, batch, n_graphs):
+    def _extend_slab_cells(
+        self,
+        q: torch.Tensor,
+        pos: torch.Tensor,
+        cell: torch.Tensor,
+        batch: torch.Tensor,
+        n_graphs: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         EW3DC for slab graphs (exactly one zero cell row).
         Returns Yeh-Berkowitz dipole correction per graph or None
         """
-        with torch.no_grad():
-            row_norm = torch.linalg.norm(cell, dim=2)               # (G, 3)
-            cand = ((row_norm > 1e-6).sum(dim=1) == 2) & (
-                torch.linalg.det(cell).abs() <= 1e-6
-            )
-            if not bool(cand.any()):
-                return cell, None
-            i0 = torch.argmin(row_norm, dim=1)                      # zero row
+        # masks/paddings via detach() instead of torch.no_grad() blocks:
+        # TorchScript's IR miscompiles multiple with-blocks + early returns
+        # in one method (outputs_[i]->uses().empty() internal assert)
+        row_norm = torch.linalg.norm(cell, dim=2).detach()          # (G, 3)
+        cand = ((row_norm > 1e-6).sum(dim=1) == 2) & (
+            torch.linalg.det(cell).abs().detach() <= 1e-6
+        )
+        i0 = torch.argmin(row_norm, dim=1)                          # zero row
+        if not bool(cand.any()):
+            return cell, None
 
         g = torch.arange(n_graphs, device=cell.device)
         a_j = cell[g, (i0 + 1) % 3]
         a_k = cell[g, (i0 + 2) % 3]
         nvec = torch.linalg.cross(a_j, a_k)                         # (G, 3)
-        with torch.no_grad():
-            is_2d = cand & (torch.linalg.norm(nvec, dim=1) > 1e-6)
-            if not bool(is_2d.any()):
-                return cell, None
+        is_2d = cand & (torch.linalg.norm(nvec, dim=1).detach() > 1e-6)
+        if not bool(is_2d.any()):
+            return cell, None
         # unit fallback keeps norm/div grads NaN-free on non-slab graphs
         ez = torch.zeros_like(nvec)
         ez[:, 2] = 1.0
@@ -242,20 +275,20 @@ class LatentEwaldSum(nn.Module):
         n_hat = nvec / torch.linalg.norm(nvec, dim=1, keepdim=True)
 
         z = (pos * n_hat[batch]).sum(dim=1)                         # (N,)
-        with torch.no_grad():
-            fmax = torch.finfo(z.dtype).max
-            zmax = torch.full(
-                (n_graphs,), -fmax, device=z.device, dtype=z.dtype
-            ).scatter_reduce(0, batch, z, 'amax')
-            zmin = torch.full(
-                (n_graphs,), fmax, device=z.device, dtype=z.dtype
-            ).scatter_reduce(0, batch, z, 'amin')
-            pad = (
-                self.slab_vacuum_factor * row_norm.max(dim=1).values
-            ).clamp(min=self.slab_min_pad)
-            lz = (zmax - zmin).clamp(min=0.0) + pad                 # (G,)
+        z_d = z.detach()
+        fmax = float('inf')  # torch.finfo is not TorchScript-able
+        zmax = torch.full(
+            (n_graphs,), -fmax, device=z.device, dtype=z.dtype
+        ).scatter_reduce(0, batch, z_d, 'amax')
+        zmin = torch.full(
+            (n_graphs,), fmax, device=z.device, dtype=z.dtype
+        ).scatter_reduce(0, batch, z_d, 'amin')
+        pad = (
+            self.slab_vacuum_factor * row_norm.max(dim=1).values
+        ).clamp(min=self.slab_min_pad)
+        lz = (zmax - zmin).clamp(min=0.0) + pad                     # (G,)
 
-        row_sel = torch.nn.functional.one_hot(i0, 3).bool()         # (G, 3)
+        row_sel = torch.nn.functional.one_hot(i0, 3).to(torch.bool)  # (G, 3)
         mask = (is_2d.unsqueeze(1) & row_sel).unsqueeze(2)          # (G, 3, 1)
         new_row = (lz.unsqueeze(1) * n_hat).unsqueeze(1)            # (G, 1, 3)
         cell = torch.where(mask, new_row, cell)
@@ -299,33 +332,56 @@ class LatentEwaldSum(nn.Module):
         # slab (2D) graphs: vacuum-pad the cell + Yeh-Berkowitz correction
         cell, e_slab = self._extend_slab_cells(q, pos, cell, batch, n_graphs)
 
-        # reciprocal sum for periodic graphs, direct sum for open (det ~ 0)
+        # routing by zero-row pattern (post slab extension): 3 nonzero rows
+        # (det > 0, incl. padded slabs) -> reciprocal Ewald, exactly 1 ->
+        # wire (1D Ewald along that row), else -> open-boundary direct sum
+        row_norm = torch.linalg.norm(cell, dim=2)              # (n_graphs, 3)
         is_pbc = torch.linalg.det(cell).abs() > 1e-6           # (n_graphs,)
+        is_1d = ((row_norm > 1e-6).sum(dim=1) == 1) & ~is_pbc
+        is_0d = ~is_pbc & ~is_1d
+        axis_1d = cell[
+            torch.arange(n_graphs, device=pos.device),
+            torch.argmax(row_norm, dim=1),
+        ]                                                      # (n_graphs, 3)
+
         if bool(is_pbc.all()):
             e_lr = self.ewald(q=q, r=pos, cell=cell, batch=batch)
-        elif not bool(is_pbc.any()):
+        elif bool(is_1d.all()):
+            e_lr = self.ewald_1d(
+                q=q, r=pos, axis=axis_1d, batch=batch, n_graphs=n_graphs
+            )
+        elif bool(is_0d.all()):
             e_lr = self.direct(q=q, r=pos, batch=batch, n_graphs=n_graphs)
         else:
-            atom_pbc = is_pbc[batch]
-            remap_p = torch.cumsum(is_pbc.long(), 0) - 1
-            remap_o = torch.cumsum((~is_pbc).long(), 0) - 1
-            e_p = self.ewald(
-                q=q[atom_pbc],
-                r=pos[atom_pbc],
-                cell=cell[is_pbc],
-                batch=remap_p[batch[atom_pbc]],
-            )
-            e_o = self.direct(
-                q=q[~atom_pbc],
-                r=pos[~atom_pbc],
-                batch=remap_o[batch[~atom_pbc]],
-                n_graphs=n_graphs - int(is_pbc.sum().item()),
-            )
+            # explicit per-kind blocks (a heterogeneous (str, Tensor) tuple
+            # loop is not TorchScript-able)
             e_lr = torch.zeros(
                 n_graphs, device=pos.device, dtype=pos.dtype
             )
-            e_lr[is_pbc] = e_p
-            e_lr[~is_pbc] = e_o
+            if bool(is_pbc.any()):
+                amask = is_pbc[batch]
+                sub_batch = (torch.cumsum(is_pbc.long(), 0) - 1)[batch[amask]]
+                e_sub = self.ewald(
+                    q=q[amask], r=pos[amask],
+                    cell=cell[is_pbc], batch=sub_batch,
+                )
+                e_lr = e_lr.index_put([is_pbc.nonzero().squeeze(1)], e_sub)
+            if bool(is_1d.any()):
+                amask = is_1d[batch]
+                sub_batch = (torch.cumsum(is_1d.long(), 0) - 1)[batch[amask]]
+                e_sub = self.ewald_1d(
+                    q=q[amask], r=pos[amask], axis=axis_1d[is_1d],
+                    batch=sub_batch, n_graphs=int(is_1d.sum().item()),
+                )
+                e_lr = e_lr.index_put([is_1d.nonzero().squeeze(1)], e_sub)
+            if bool(is_0d.any()):
+                amask = is_0d[batch]
+                sub_batch = (torch.cumsum(is_0d.long(), 0) - 1)[batch[amask]]
+                e_sub = self.direct(
+                    q=q[amask], r=pos[amask],
+                    batch=sub_batch, n_graphs=int(is_0d.sum().item()),
+                )
+                e_lr = e_lr.index_put([is_0d.nonzero().squeeze(1)], e_sub)
 
         if e_slab is not None:
             e_lr = e_lr + e_slab
