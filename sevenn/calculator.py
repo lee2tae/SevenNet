@@ -79,8 +79,11 @@ class SevenNetCalculator(Calculator):
             BEC module is parameter-free, so this works on any LES checkpoint
             without retraining. Requires file_type='checkpoint'.
         compute_dipole: bool, default=False
-            If True, expose the dipole moment in ``calc.results['dipole']``
-            as a (3,) array. Requires file_type='checkpoint'.
+            If True, expose the dipole moment sum_i q_i r_i (e*Angstrom) in
+            ``calc.results['dipole']`` as a (3,) array. For periodic cells it
+            depends on the image convention of the positions (per-atom
+            quantum q_i*L); use differences along a trajectory or relative
+            to a reference structure. Requires file_type='checkpoint'.
         epsilon_factor: float | None, default=None
             High-frequency dielectric constant ε∞. The polarization (and hence
             BEC/dipole) is scaled by √ε∞ to recover physical charges from the

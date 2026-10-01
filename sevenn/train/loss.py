@@ -72,8 +72,9 @@ class LossDefinition:
             pred, ref, w_tensor = self._ignore_unlabeled(pred, ref, w_tensor)
 
         if len(pred) == 0:
-            assert self.ref_key is not None
-            return torch.zeros(1, device=batch_data[self.ref_key].device)
+            # zero loss that stays connected to the model graph
+            full_pred = batch_data[self.pred_key]
+            return (0.0 * full_pred.sum()).reshape(1)
 
         loss = self.criterion(pred, ref)
         if self.use_weight:

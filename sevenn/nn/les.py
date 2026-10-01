@@ -551,6 +551,13 @@ class BornEffectiveCharge(nn.Module):
     """
     Native Born effective charge (BEC) and dipole readout.
 
+    compute_dipole exposes sum_i q_i r_i (e*Angstrom, Cartesian) with the
+    screened, neutralized q. In periodic directions this is defined only up
+    to the image convention of the supplied positions (per-atom quantum
+    q_i*L), like any point-charge polarization; compare differences between
+    frames of one trajectory, or P relative to a reference structure, not
+    absolute values from wrapped coordinates. Divide by volume for P.
+
     epsilon_mode:
         'fixed'   → P is scaled by sqrt(epsilon_factor) (build-time constant).
         'learned' → P is scaled by sqrt(data[KEY.LES_EPS]) per graph, predicted
@@ -718,9 +725,12 @@ class BornEffectiveCharge(nn.Module):
                 (r.shape[0], 3) if self.output_index is not None
                 else (r.shape[0], 3, 3)
             )
-            data[self.data_key_out] = torch.zeros(
-                shape, device=r.device, dtype=r.dtype
-            )
+            zeros = torch.zeros(shape, device=r.device, dtype=r.dtype)
+            if self.epsilon_mode != 'fixed':
+                # keep epsilon-head params in the graph (DDP needs a grad
+                # for every parameter on every rank each step)
+                zeros = zeros + 0.0 * data[self.data_key_epsilon].sum()
+            data[self.data_key_out] = zeros
             return data
 
         q = data[self.data_key_q]
@@ -775,7 +785,17 @@ class BornEffectiveCharge(nn.Module):
         p, phases, M = self._polarization(q, r, cell, batch, n_graphs, factors)
 
         if self.compute_dipole:
-            dip = torch.einsum('gea,ge->ga', M.to(p.dtype), p).real
+            # Cartesian sum_i q_i r_i (e*Angstrom) with the same scaled and
+            # neutralized q as the BEC. Positions are used as supplied: in
+            # periodic directions the result depends on the image convention
+            # (quantum q_i*L). Finite differences match Z*.dr exactly for
+            # fixed q; with charge flow the BEC's periodic sin(phi_j-phi_i)
+            # weighting has no single-valued P, so compare dP along a path.
+            # (The Berry phase-sum p is kept for the BEC derivative only; its
+            # real part is not a dipole once atoms spread over the cell.)
+            dip = torch.zeros(n_graphs, 3, device=r.device, dtype=r.dtype)
+            dip.index_add_(0, batch, q * r)
+            dip = dip * factors.unsqueeze(1)
             if self.output_index is not None:
                 dip = dip[:, self.output_index]           # (n_graphs,)
             data[self.data_key_dipole] = (

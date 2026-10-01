@@ -1,5 +1,45 @@
 """
-1D-periodic Ewald kernels for SevenNet LES.
+1D-periodic (wire) Ewald kernels for SevenNet LES.
+
+Physical target (same smeared kernel as ewald.py, images along one axis):
+    E_g = (norm_factor/4pi) * sum_c sum_{(i,n)!=(j,0)} q_i^c q_j^c
+              * erf(alpha*|d_ij + n L a_hat|) / |d_ij + n L a_hat|
+    alpha = 1/(sqrt(2) sigma)
+
+Poisson summation along the periodic axis only (Porto J. Phys. A 33, 6211
+(2000); Tornberg Adv. Comput. Math. 42, 227 (2016)) turns the conditionally
+convergent image sum into an exponentially convergent mode sum:
+
+    F(u, th) = 2 sum_n w0_n (e^{-u P0_n} - 1)
+             + 4 sum_{m=1}^{M} cos(m th) sum_n w_n e^{-beta1 m^2 E2_n} e^{-u P_n}
+    E_pair   = q_i q_j F(u_ij, th_ij) / L
+
+with u = |xperp_i - xperp_j|^2 (transverse), th = k1 (z_i - z_j) (scaled
+axial), k1 = 2pi/L, beta1 = sigma^2 k1^2 / 2. The two node sums are
+Gauss-Legendre quadratures of the exact integrals after t = alpha e^{-s}:
+
+    V_m(u)  = int_0^alpha dt/t exp(-u t^2 - k_m^2/4t^2)   (incomplete Bessel)
+    V_0(u)  = int_0^alpha dt/t (exp(-u t^2) - 1) = -Ein(alpha^2 u)/2
+
+The "-1" in V_0 drops the log-divergent constant of the k_z=0 mode: the
+neutralizing-background convention, the exact 1D analog of dropping k=0 in
+the 3D kernel (charge-neutral cells are unaffected by the choice).
+The mode cutoff uses the same damping exp(-sigma^2 k_m^2/2) as the 3D
+reciprocal kernels. The i=j diagonal is the interaction of an atom with its
+own images (finite: F(0,0) = sum_m V_m(0)); the (i,0)=(j,0) self term
+2 alpha/sqrt(pi) is removed by the same self-interaction expression the
+reciprocal kernels use.
+
+Quadrature grids are detached (converged quadrature => node placement has
+no first-order effect); beta1, k1 and 1/L stay differentiable, so forces
+and the cell-row (stress) gradient are exact. Validated against brute-force
+image sums: energy ~1e-9, forces / dE/d(axis) ~1e-9.
+
+Batching: quadrature grids are built PER GRAPH (each sized to its own L
+and transverse span), so a graph's energy is exactly batch-invariant --
+identical to its single-graph value regardless of batch composition, the
+same guarantee the 3D/2D/0D kernels provide via exact per-graph mode
+enumeration.
 """
 import math
 from typing import Optional, Tuple
@@ -113,6 +153,12 @@ class _Ewald1DGrids(nn.Module):
 class Ewald1DSum(nn.Module):
     """
     1D-periodic (wire) screened Coulomb energy, batched over graphs.
+
+    E_g = (norm_factor/4pi) sum_c sum_{ij in g} q_i q_j F(u_ij, th_ij)/L_g
+          [- self term], the exact 1D Ewald of the LES smeared kernel.
+
+    forward(q, r, axis, batch) -> [n_graphs]; axis is the (G, 3) nonzero
+    lattice row of each wire graph (differentiable -> axial stress).
     """
 
     def __init__(
@@ -213,6 +259,21 @@ class Ewald1DSum(nn.Module):
 
 
 # ===================== triton implementation =====================
+# Pair kernel, per graph (il = 1/L, b1 = beta1 = sigma^2 (2pi/L)^2 / 2):
+#   Phi = il * F(u, th),  u = |dxp|^2, th = zeta_i - zeta_j
+#   F = sum_n0 W0[e^{-u P0} - 1]
+#     + sum_{m=1..M} cos(m th) sum_n W e^{-b1 m^2 E2_n} e^{-u P_n}
+# Derivative sums accumulated in-kernel (t = W_n e^{-b1 m^2 E2_n}, A = e^{-u P},
+# c = cos(m th), s = sin(m th); m=0 nodes contribute to F, F_u, F_uu only):
+#   F_u    = -sum W0 P0 A0 - sum t P A c        F_th   = -sum t A m s
+#   F_uu   = +sum W0 P0^2 A0 + sum t P^2 A c    F_uth  = +sum t P A m s
+#   F_thth = -sum t A m^2 c                     F_be   = -sum t (m^2 E2) A c
+#   F_ube  = +sum t (m^2 E2) P A c              F_thbe = +sum t (m^2 E2) A m s
+#   F_bebe = +sum t (m^2 E2)^2 A c
+# Autograd wiring mirrors TritonDirectSum: _W1Fwd -> _W1Bwd (analytic VJP)
+# -> _w1_ddw_* (double backward), with per-graph (1/L, beta1) gradient
+# channels so the cell-row (stress) path stays exact.
+
 if _HAS_TRITON:
     BLK1D = 64
 
