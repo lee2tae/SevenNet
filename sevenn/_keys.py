@@ -61,6 +61,8 @@ PRED_TOTAL_ENERGY: Final[str] = 'inferred_total_energy'
 # LES (Latent Ewald Summation) outputs
 LES_Q: Final[str] = 'les_latent_charge'           # (N_atoms, n_charges) per-atom latent charges
 LES_F: Final[str] = 'les_fukui_factor'             # (N_atoms, 1) Fukui-style redistribution weight
+LES_MU: Final[str] = 'les_latent_dipole'          # (N_atoms, 3) per-atom latent dipoles
+LES_VEC_FEATURE: Final[str] = 'les_vec_feature'    # node features tapped for the dipole readout
 SR_ENERGY: Final[str] = 'les_sr_energy'            # (n_graphs,) short-range energy sum
 LR_ENERGY: Final[str] = 'les_lr_energy'            # (n_graphs,) long-range Ewald energy
 LES_BEC: Final[str] = 'les_born_eff_charge'        # (N_atoms, 3, 3) Born effective charges
@@ -68,6 +70,9 @@ LES_DIPOLE: Final[str] = 'les_dipole'              # (n_graphs, 3) dipole moment
 LES_BEC_REF: Final[str] = 'les_bec_ref'            # (N_atoms, 3, 3) reference DFT Born charges
 LES_EPS_ATOMIC: Final[str] = 'les_eps_atomic'      # (N_atoms, 1) raw per-atom epsilon feature
 LES_EPS: Final[str] = 'les_epsilon'                # (n_graphs,) predicted epsilon factor
+LES_ALPHA_RAW: Final[str] = 'les_alpha_raw'        # (N_atoms, 1) raw per-atom polarizability feature
+LES_ALPHA: Final[str] = 'les_polarizability'       # (N_atoms,) atomic polarizability alpha_i (Angstrom^3)
+LES_MU_IND: Final[str] = 'les_induced_dipole'      # (N_atoms, 3) self-consistent induced dipoles (BEC head)
 
 PRED_PER_ATOM_ENERGY: Final[str] = 'inferred_per_atom_energy'
 PER_ATOM_ENERGY: Final[str] = 'per_atom_energy'

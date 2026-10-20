@@ -67,7 +67,7 @@ model:
         epsilon_mode: learned_atomic              # Default: 'fixed'. | 'learned' (per-graph eps) | 'learned_atomic' (per-atom eps)
         epsilon_hidden_channels: [16]             # Hidden widths of the epsilon readout MLP. [] -> single IrrepsLinear.
         epsilon_min_one: True                     # Default. True (anti-screening prohibited)
-        remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'(only for learned_atomic)
+        remove_mean: q_projection                 # BEC re-neutralization. 'uniform' (default) | 'none' | 'q_projection'(only for per-atom eps)
 
         freeze_sr: False                          # Default: False -> train SR + LES jointly (training from scratch).
                                                   # True -> freeze SR; train the LES branch (q, fukui, epsilon).

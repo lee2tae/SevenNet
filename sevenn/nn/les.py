@@ -582,8 +582,10 @@ class BornEffectiveCharge(nn.Module):
         output_index: Optional[int] = None,
         compute_bec: bool = False,
         compute_dipole: bool = False,
+        asr_projection: bool = False,
     ):
         super().__init__()
+        self.asr_projection = asr_projection
         if epsilon_mode not in ('fixed', 'learned', 'learned_atomic'):
             raise ValueError(
                 f"Unknown epsilon_mode: {epsilon_mode!r}. "
@@ -693,6 +695,16 @@ class BornEffectiveCharge(nn.Module):
         p = torch.where(dmask, p_pbc, p_open.to(cdtype))
         M = safe_cell                                            # (G, 3, 3)
         return p * factors.unsqueeze(1), phase, M
+
+    def _asr_project(self, result, batch, n_graphs):
+        # acoustic sum rule: Z*_i -= (1/N) sum_j Z*_j per graph (uniform projection, as DFPT codes do)
+        if not self.asr_projection:
+            return result
+        tot = torch.zeros((n_graphs,) + tuple(result.shape[1:]), device=result.device, dtype=result.dtype)
+        tot.index_add_(0, batch, result)
+        cnt = torch.zeros(n_graphs, device=result.device, dtype=result.dtype)
+        cnt.index_add_(0, batch, torch.ones(result.shape[0], device=result.device, dtype=result.dtype))
+        return result - (tot / cnt.view(-1, *([1] * (result.dim() - 1))))[batch]
 
     def _bec_grad_batched(self, p, r, phase):
         # All lattice-component x {real, imag} cotangents in one vmapped
@@ -825,6 +837,7 @@ class BornEffectiveCharge(nn.Module):
             result = torch.einsum('nea,neb->nab', M[batch], z)
             if self.output_index is not None:
                 result = result[:, self.output_index]     # (N, 3)
+            result = self._asr_project(result, batch, n_graphs)
             data[self.data_key_out] = result
 
         return data

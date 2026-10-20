@@ -449,6 +449,31 @@ def _to_parallel_model(
     return layers_list
 
 
+def _build_lr_energy(les_cfg: dict):
+    _pol = les_cfg.get('polarizable', None)
+    if _pol and isinstance(_pol, dict) and _pol.get('in_energy', False):
+        from .nn.les_pol import LatentEwaldSumQUPol
+        return LatentEwaldSumQUPol(
+            les_args=les_cfg.get('les_args', {}),
+            ewald_type=les_cfg.get('ewald_type', 'triton'),
+        )
+    if les_cfg.get('use_dipole', False):
+        from .nn.les_qu import LatentEwaldSumQU
+        return LatentEwaldSumQU(
+            les_args=les_cfg.get('les_args', {}),
+            data_key_q=KEY.LES_Q,
+            data_key_mu=KEY.LES_MU,
+            data_key_out=KEY.LR_ENERGY,
+            ewald_type=les_cfg.get('ewald_type', 'triton'),
+        )
+    return LatentEwaldSum(
+        les_args=les_cfg.get('les_args', {}),
+        data_key_in=KEY.LES_Q,
+        data_key_out=KEY.LR_ENERGY,
+        ewald_type=les_cfg.get('ewald_type', 'batched'),
+    )
+
+
 @overload
 def build_E3_equivariant_model(
     config: dict, parallel: Literal[False] = False
@@ -630,6 +655,12 @@ def build_E3_equivariant_model(
         )
         layers.update(interaction_builder(**param_interaction_block))
         irreps_x = irreps_out
+        if config.get(KEY.USE_LES, False):
+            _lc = config.get(KEY.LES_CONFIG, {})
+            if _lc.get('use_dipole', False) and t == _lc.get('dipole_feature_layer', num_convolution_layer - 2):
+                from .nn.les_qu import FeatureTap
+                layers[f'{t}_les_vec_tap'] = FeatureTap(KEY.NODE_FEATURE, KEY.LES_VEC_FEATURE)
+                _dipole_irreps = irreps_x
 
     if config.get(KEY.USE_LES, False):
         les_cfg = config.get(KEY.LES_CONFIG, {})
@@ -659,6 +690,20 @@ def build_E3_equivariant_model(
         if _neutral != 'none':
             layers['les_neutralize'] = NeutralizeCharge(mode=_neutral)
 
+        _use_mu = les_cfg.get('use_dipole', False)
+        if _use_mu:
+            from .nn.les_qu import LatentDipoleReadout
+            _tap_layer = les_cfg.get('dipole_feature_layer', num_convolution_layer - 2)
+            if f'{_tap_layer}_les_vec_tap' not in layers:
+                raise ValueError(f'dipole_feature_layer={_tap_layer} is not a valid interaction block index')
+            layers['les_dipole_readout'] = LatentDipoleReadout(
+                irreps_in=_dipole_irreps,  # type: ignore
+                data_key_in=KEY.LES_VEC_FEATURE,
+                data_key_out=KEY.LES_MU,
+                hidden_channels=les_cfg.get('dipole_hidden_channels', None),
+                zero_init=les_cfg.get('dipole_zero_init', False),
+            )
+
         _bec_needed = (
             les_cfg.get('compute_bec', False)
             or les_cfg.get('compute_dipole', False)
@@ -683,6 +728,20 @@ def build_E3_equivariant_model(
                 mode='atom' if _epsilon_mode == 'learned_atomic' else 'graph',
                 min_one=les_cfg.get('epsilon_min_one', False),
             )
+        _pol = les_cfg.get('polarizable', None)
+        if _pol and (_bec_needed or (isinstance(_pol, dict) and _pol.get('in_energy', False))):
+            _pol = _pol if isinstance(_pol, dict) else {}
+            from .nn.les_pol import PolarizabilityReadout
+            layers['les_alpha_readout'] = LatentChargeReadout(
+                irreps_in=irreps_x,  # type: ignore
+                data_key_in=KEY.NODE_FEATURE,
+                data_key_out=KEY.LES_ALPHA_RAW,
+                n_charges=1,
+                hidden_channels=_pol.get('hidden_channels', None),
+            )
+            layers['les_alpha_act'] = PolarizabilityReadout(
+                init_shift=_pol.get('init_shift', -4.0),
+            )
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
@@ -695,13 +754,8 @@ def build_E3_equivariant_model(
                     data_key_in=KEY.ATOMIC_ENERGY,
                     data_key_out=KEY.SR_ENERGY,
                 ),
-                # LR energy: Ewald summation on latent charges
-                'les_lr_energy': LatentEwaldSum(
-                    les_args=les_cfg.get('les_args', {}),
-                    data_key_in=KEY.LES_Q,
-                    data_key_out=KEY.LR_ENERGY,
-                    ewald_type=les_cfg.get('ewald_type', 'batched'),
-                ),
+                # LR energy: Ewald summation on latent charges (+ dipoles)
+                'les_lr_energy': _build_lr_energy(les_cfg),
                 # Total = SR + LR
                 'add_lr_to_total': AddLREnergy(
                     key_sr=KEY.SR_ENERGY,
@@ -722,7 +776,19 @@ def build_E3_equivariant_model(
         )
 
     if config.get(KEY.USE_LES, False) and _bec_needed:
-        layers['les_bec'] = BornEffectiveCharge(
+        _bec_cls = BornEffectiveCharge
+        if les_cfg.get('use_dipole', False):
+            from .nn.les_qu import BornEffectiveChargeQU
+            _bec_cls = BornEffectiveChargeQU
+        _bec_extra = {}
+        if les_cfg.get('polarizable', None):
+            if not les_cfg.get('use_dipole', False):
+                raise ValueError("'polarizable' BEC head requires use_dipole: True")
+            from .nn.les_pol import PolarizableBornEffectiveChargeQU
+            _bec_cls = PolarizableBornEffectiveChargeQU
+            _bec_extra = {'les_args': les_cfg.get('les_args', {}), 'ewald_type': les_cfg.get('ewald_type', 'triton')}
+        layers['les_bec'] = _bec_cls(
+            **_bec_extra,
             data_key_q=KEY.LES_Q,
             data_key_out=KEY.LES_BEC,
             data_key_dipole=KEY.LES_DIPOLE,
@@ -735,6 +801,7 @@ def build_E3_equivariant_model(
                 or config.get(KEY.IS_TRAIN_BEC, False)
             ),
             compute_dipole=les_cfg.get('compute_dipole', False),
+            asr_projection=les_cfg.get('bec_asr_projection', False),
         )
 
     if config.get(KEY.USE_LES, False):

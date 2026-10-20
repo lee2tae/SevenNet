@@ -40,6 +40,7 @@ class SevenNetCalculator(Calculator):
         compute_bec: bool = False,
         compute_dipole: bool = False,
         epsilon_factor: Optional[float] = None,
+        bec_asr_projection: bool = False,
         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
         **kwargs,
     ) -> None:
@@ -148,6 +149,10 @@ class SevenNetCalculator(Calculator):
             if ewald_type is not None:
                 _ = cp.config  # trigger lazy load of cp._config
                 cp._config.setdefault(KEY.LES_CONFIG, {})['ewald_type'] = ewald_type
+
+            if bec_asr_projection:
+                _ = cp.config
+                cp._config.setdefault(KEY.LES_CONFIG, {})['bec_asr_projection'] = True
 
             if compute_bec:
                 _ = cp.config  # trigger lazy load of cp._config
