@@ -611,6 +611,11 @@ def build_E3_equivariant_model(
     else:
         raise ValueError(f'Unknown interaction type: {interaction_type}')
 
+    _rs = config.get(KEY.USE_LES, False) and config.get(KEY.LES_CONFIG, {}).get('bec_mode', 'les') == 'realspace'
+    if _rs:
+        from .nn.les_rsbec import RS_Q_RAW, FeatureTap, bind_realspace_bec, realspace_bec_cls, rs_conv_taps
+    _q_layer = config.get(KEY.LES_CONFIG, {}).get('charge_feature_layer') if config.get(KEY.USE_LES, False) else None
+    _q_irreps, _q_key = None, KEY.NODE_FEATURE  # charge/fukui/epsilon readout input (default: last block)
     for t in range(num_convolution_layer):
         param_interaction_block.update(
             {
@@ -653,7 +658,8 @@ def build_E3_equivariant_model(
                 'irreps_out': irreps_out,
             }
         )
-        layers.update(interaction_builder(**param_interaction_block))
+        _blk = interaction_builder(**param_interaction_block)
+        layers.update(rs_conv_taps(_blk, t) if _rs and t > 0 else _blk)
         irreps_x = irreps_out
         if config.get(KEY.USE_LES, False):
             _lc = config.get(KEY.LES_CONFIG, {})
@@ -661,6 +667,10 @@ def build_E3_equivariant_model(
                 from .nn.les_qu import FeatureTap
                 layers[f'{t}_les_vec_tap'] = FeatureTap(KEY.NODE_FEATURE, KEY.LES_VEC_FEATURE)
                 _dipole_irreps = irreps_x
+            if _q_layer is not None and t == _q_layer and t < num_convolution_layer - 1:
+                from .nn.les_qu import FeatureTap as _QTap
+                layers[f'{t}_les_q_tap'] = _QTap(KEY.NODE_FEATURE, 'les_q_feature')
+                _q_irreps, _q_key = irreps_x, 'les_q_feature'
 
     if config.get(KEY.USE_LES, False):
         les_cfg = config.get(KEY.LES_CONFIG, {})
@@ -668,20 +678,22 @@ def build_E3_equivariant_model(
         # reduce_input_to_hidden overwrites KEY.NODE_FEATURE in-place.
         # Reading here guarantees we use the full (pre-projection) node features.
         layers['les_charge_readout'] = LatentChargeReadout(
-            irreps_in=irreps_x,  # type: ignore
-            data_key_in=KEY.NODE_FEATURE,
+            irreps_in=irreps_x if _q_irreps is None else _q_irreps,  # type: ignore
+            data_key_in=_q_key,
             data_key_out=KEY.LES_Q,
             n_charges=les_cfg.get('n_charges', 1),
             hidden_channels=les_cfg.get('hidden_channels', None),
             zero_init=les_cfg.get('zero_init', False),
         )
+        if _rs:
+            layers['les_rs_q_raw_tap'] = FeatureTap(KEY.LES_Q, RS_Q_RAW)
 
         # Charge-neutralization
         _neutral = les_cfg.get('neutralize_mode', 'none')
         if _neutral == 'fukui':
             layers['les_fukui_readout'] = LatentChargeReadout(
-                irreps_in=irreps_x,  # type: ignore
-                data_key_in=KEY.NODE_FEATURE,
+                irreps_in=irreps_x if _q_irreps is None else _q_irreps,  # type: ignore
+                data_key_in=_q_key,
                 data_key_out=KEY.LES_F,
                 n_charges=1,
                 hidden_channels=les_cfg.get('fukui_hidden_channels', None),
@@ -718,8 +730,8 @@ def build_E3_equivariant_model(
         # Epsilon head also reads full node features, so it sits here too.
         if _bec_needed and _epsilon_mode in ('learned', 'learned_atomic'):
             layers['les_epsilon_readout'] = LatentChargeReadout(
-                irreps_in=irreps_x,  # type: ignore
-                data_key_in=KEY.NODE_FEATURE,
+                irreps_in=irreps_x if _q_irreps is None else _q_irreps,  # type: ignore
+                data_key_in=_q_key,
                 data_key_out=KEY.LES_EPS_ATOMIC,
                 n_charges=1,
                 hidden_channels=les_cfg.get('epsilon_hidden_channels', None),
@@ -787,6 +799,12 @@ def build_E3_equivariant_model(
             from .nn.les_pol import PolarizableBornEffectiveChargeQU
             _bec_cls = PolarizableBornEffectiveChargeQU
             _bec_extra = {'les_args': les_cfg.get('les_args', {}), 'ewald_type': les_cfg.get('ewald_type', 'triton')}
+        if _rs:
+            if les_cfg.get('polarizable', None):
+                raise ValueError("bec_mode: realspace does not support 'polarizable'")
+            _bec_cls = realspace_bec_cls(_bec_cls)
+            _bec_extra = {'conv_layers': list(range(1, num_convolution_layer)), 'gauge': les_cfg.get('bec_gauge', 'mid'),
+                          'neutralize_mode': les_cfg.get('neutralize_mode', 'none')}
         layers['les_bec'] = _bec_cls(
             **_bec_extra,
             data_key_q=KEY.LES_Q,
@@ -826,10 +844,13 @@ def build_E3_equivariant_model(
     }
 
     if parallel:
+        if _rs:
+            raise ValueError('bec_mode: realspace is not supported in parallel models')
         layers_list = _to_parallel_model(layers, config)
         return [
             AtomGraphSequential(patch_modules(layers, config), **common_args)
             for layers in layers_list
         ]
     else:
-        return AtomGraphSequential(patch_modules(layers, config), **common_args)
+        model = AtomGraphSequential(patch_modules(layers, config), **common_args)
+        return bind_realspace_bec(model) if _rs else model
