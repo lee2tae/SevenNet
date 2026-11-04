@@ -805,6 +805,11 @@ def build_E3_equivariant_model(
             _bec_cls = realspace_bec_cls(_bec_cls)
             _bec_extra = {'conv_layers': list(range(1, num_convolution_layer)), 'gauge': les_cfg.get('bec_gauge', 'mid'),
                           'neutralize_mode': les_cfg.get('neutralize_mode', 'none')}
+        _lf = les_cfg.get('local_field', None)
+        if _lf:
+            from .nn.les_localfield import localfield_bec_cls
+            _bec_cls = localfield_bec_cls(_bec_cls)
+            _bec_extra = {**_bec_extra, **{f'lf_{k}': v for k, v in (_lf if isinstance(_lf, dict) else {}).items()}}
         layers['les_bec'] = _bec_cls(
             **_bec_extra,
             data_key_q=KEY.LES_Q,
